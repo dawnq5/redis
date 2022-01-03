@@ -124,10 +124,23 @@ client *createClient(connection *conn) {
      * This is useful since all the commands needs to be executed
      * in the context of a client. When commands are executed in other
      * contexts (for instance a Lua script) we need a non connected client. */
+    /*将NULL传递为conn可以创建未连接的客户端。
+    *这很有用，因为所有命令都需要执行
+    *在客户端的上下文中。在其他系统中执行命令时
+    *上下文（例如Lua脚本）我们需要一个未连接的客户端*/
     if (conn) {
         connEnableTcpNoDelay(conn);
         if (server.tcpkeepalive)
             connKeepAlive(conn,server.tcpkeepalive);
+        //connSetReadHandler这里的conn->type 实际类型是 CT_Socket,connection.c 中 CT_Socket set_read_handler函数是 connSocketSetReadHandler
+        //connection.c connSetReadHandler方法中的代码: conn->type->set_read_handler(conn, func) 等于 connSocketSetReadHandler(conn, func)
+        /**
+         * connection.c connSocketSetReadHandler方法中的代码:
+         * 1,conn->read_handler = func,就是conn->read_handler=readQueryFromClient
+         * 2,aeCreateFileEvent 将当前客户端socket 文件描述符 注册到epoll_ctl,并且事件处理函数为conn->type->ae_handler.大概296行,callHandler(conn, conn->read_handler),调用read_handler函数,也就是调用了readQueryFromClient
+         * 也就是说一旦有事件可读,就会触发 connSocketEventHandler 函数调用,connSocketEventHandler 会触发readQueryFromClient调用
+         */
+
         connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
     }
@@ -1147,6 +1160,7 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
     }
 
     /* Create connection and client */
+    //创建client,设置一些默认值,对connection做一些设置
     if ((c = createClient(conn)) == NULL) {
         serverLog(LL_WARNING,
             "Error registering fd event for the new client: %s (conn: %s)",
@@ -1167,6 +1181,7 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
      *
      * Because of that, we must do nothing else afterwards.
      */
+    //为客户端连接设置事件处理器
     if (connAccept(conn, clientAcceptHandler) == C_ERR) {
         char conninfo[100];
         if (connGetState(conn) == CONN_STATE_ERROR)
@@ -1177,7 +1192,9 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
         return;
     }
 }
-
+/**
+ * 这个方法负责接受客户端连接
+ */
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
     char cip[NET_IP_STR_LEN];
@@ -2375,7 +2392,10 @@ void readQueryFromClient(connection *conn) {
 
     /* There is more data in the client input buffer, continue parsing it
      * and check if there is a full command to execute. */
-     if (processInputBuffer(c) == C_ERR)
+
+
+    /*客户端输入缓冲区中有更多数据，请继续分析它并检查是否有完整的命令要执行*/
+    if (processInputBuffer(c) == C_ERR)
          c = NULL;
 
 done:
