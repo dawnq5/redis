@@ -30,7 +30,6 @@
 #include "server.h"
 #include "atomicvar.h"
 #include "cluster.h"
-#include "script.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <math.h>
@@ -134,13 +133,7 @@ client *createClient(connection *conn) {
             connKeepAlive(conn,server.tcpkeepalive);
         //connSetReadHandler这里的conn->type 实际类型是 CT_Socket,connection.c 中 CT_Socket set_read_handler函数是 connSocketSetReadHandler
         //connection.c connSetReadHandler方法中的代码: conn->type->set_read_handler(conn, func) 等于 connSocketSetReadHandler(conn, func)
-        /**
-         * connection.c connSocketSetReadHandler方法中的代码:
-         * 1,conn->read_handler = func,就是conn->read_handler=readQueryFromClient
-         * 2,aeCreateFileEvent 将当前客户端socket 文件描述符 注册到epoll_ctl,并且事件处理函数为conn->type->ae_handler.大概296行,callHandler(conn, conn->read_handler),调用read_handler函数,也就是调用了readQueryFromClient
-         * 也就是说一旦有事件可读,就会触发 connSocketEventHandler 函数调用,connSocketEventHandler 会触发readQueryFromClient调用
-         */
-
+        //connection.c connSocketSetReadHandler方法中的代码:conn->read_handler = func,就是conn->read_handler=readQueryFromClient
         connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
     }
@@ -184,7 +177,6 @@ client *createClient(connection *conn) {
     c->slave_listening_port = 0;
     c->slave_addr = NULL;
     c->slave_capa = SLAVE_CAPA_NONE;
-    c->slave_req = SLAVE_REQ_NONE;
     c->reply = listCreate();
     c->reply_bytes = 0;
     c->obuf_soft_limit_reached_time = 0;
@@ -203,7 +195,6 @@ client *createClient(connection *conn) {
     c->watched_keys = listCreate();
     c->pubsub_channels = dictCreate(&objectKeyPointerValueDictType);
     c->pubsub_patterns = listCreate();
-    c->pubsubshard_channels = dictCreate(&objectKeyPointerValueDictType);
     c->peerid = NULL;
     c->sockname = NULL;
     c->client_list_node = NULL;
@@ -276,7 +267,7 @@ void clientInstallWriteHandler(client *c) {
 int prepareClientToWrite(client *c) {
     /* If it's the Lua client we always return ok without installing any
      * handler since there is no socket at all. */
-    if (c->flags & (CLIENT_SCRIPT|CLIENT_MODULE)) return C_OK;
+    if (c->flags & (CLIENT_LUA|CLIENT_MODULE)) return C_OK;
 
     /* If CLIENT_CLOSE_ASAP flag is set, we need not write anything. */
     if (c->flags & CLIENT_CLOSE_ASAP) return C_ERR;
@@ -369,17 +360,6 @@ void _addReplyProtoToList(client *c, const char *s, size_t len) {
 
 void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return;
-
-    /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
-     * replication link that caused a reply to be generated we'll simply disconnect it.
-     * Note this is the simplest way to check a command added a response. Replication links are used to write data but
-     * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
-        serverLog(LL_WARNING, "Replica generated a reply to command %s, disconnecting it",
-                  c->lastcmd ? c->lastcmd->name : "<unknown>");
-        freeClientAsync(c);
-        return;
-    }
 
     size_t reply_len = _addReplyToBuffer(c,s,len);
     if (len > reply_len) _addReplyProtoToList(c,s+reply_len,len-reply_len);
@@ -496,7 +476,7 @@ void afterErrorReply(client *c, const char *s, size_t len) {
         }
 
         if (len > 4096) len = 4096;
-        const char *cmdname = c->lastcmd ? c->lastcmd->name : "<unknown>";
+        char *cmdname = c->lastcmd ? c->lastcmd->name : "<unknown>";
         serverLog(LL_WARNING,"== CRITICAL == This %s is sending an error "
                              "to its %s: '%.*s' after processing the command "
                              "'%s'", from, to, (int)len, s, cmdname);
@@ -1052,18 +1032,6 @@ int clientHasPendingReplies(client *c) {
     }
 }
 
-/* Return true if client connected from loopback interface */
-int islocalClient(client *c) {
-    /* unix-socket */
-    if (c->flags & CLIENT_UNIX_SOCKET) return 1;
-
-    /* tcp */
-    char cip[NET_IP_STR_LEN+1] = { 0 };
-    connPeerToString(c->conn, cip, sizeof(cip)-1, NULL);
-
-    return !strcmp(cip,"127.0.0.1") || !strcmp(cip,"::1");
-}
-
 void clientAcceptHandler(connection *conn) {
     client *c = connGetPrivateData(conn);
 
@@ -1080,9 +1048,13 @@ void clientAcceptHandler(connection *conn) {
      * requests from non loopback interfaces. Instead we try to explain the
      * user what to do to fix it if needed. */
     if (server.protected_mode &&
-        DefaultUser->flags & USER_FLAG_NOPASS)
+        DefaultUser->flags & USER_FLAG_NOPASS &&
+        !(c->flags & CLIENT_UNIX_SOCKET))
     {
-        if (!islocalClient(c)) {
+        char cip[NET_IP_STR_LEN+1] = { 0 };
+        connPeerToString(conn, cip, sizeof(cip)-1, NULL);
+
+        if (strcmp(cip,"127.0.0.1") && strcmp(cip,"::1")) {
             char *err =
                 "-DENIED Redis is running in protected mode because protected "
                 "mode is enabled and no password is set for the default user. "
@@ -1442,11 +1414,9 @@ void freeClient(client *c) {
 
     /* Unsubscribe from all the pubsub channels */
     pubsubUnsubscribeAllChannels(c,0);
-    pubsubUnsubscribeShardAllChannels(c, 0);
     pubsubUnsubscribeAllPatterns(c,0);
     dictRelease(c->pubsub_channels);
     listRelease(c->pubsub_patterns);
-    dictRelease(c->pubsubshard_channels);
 
     /* Free data structures. */
     listRelease(c->reply);
@@ -1532,7 +1502,7 @@ void freeClientAsync(client *c) {
      * may access the list while Redis uses I/O threads. All the other accesses
      * are in the context of the main thread while the other threads are
      * idle. */
-    if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_SCRIPT) return;
+    if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;
     c->flags |= CLIENT_CLOSE_ASAP;
     if (server.io_threads_num == 1) {
         /* no need to bother with locking if there's just one thread (the main thread) */
@@ -2240,7 +2210,7 @@ int processInputBuffer(client *c) {
          * condition on the slave. We want just to accumulate the replication
          * stream (instead of replying -BUSY like we do with other clients) and
          * later resume the processing. */
-        if (scriptIsTimedout() && c->flags & CLIENT_MASTER) break;
+        if (server.lua_timedout && c->flags & CLIENT_MASTER) break;
 
         /* CLIENT_CLOSE_AFTER_REPLY closes the connection once the reply is
          * written to the client. Make sure to not let the reply grow after
@@ -2615,7 +2585,6 @@ void resetCommand(client *c) {
     discardTransaction(c);
 
     pubsubUnsubscribeAllChannels(c,0);
-    pubsubUnsubscribeShardAllChannels(c, 0);
     pubsubUnsubscribeAllPatterns(c,0);
 
     if (c->name) {
@@ -2660,7 +2629,7 @@ void clientCommand(client *c) {
 "      Kill connections made from the specified address",
 "    * LADDR (<ip:port>|<unixsocket>:0)",
 "      Kill connections made to specified local address",
-"    * TYPE (NORMAL|MASTER|REPLICA|PUBSUB)",
+"    * TYPE (normal|master|replica|pubsub)",
 "      Kill connections by type.",
 "    * USER <username>",
 "      Kill connections authenticated by <username>.",
@@ -2786,11 +2755,10 @@ NULL
                 int moreargs = c->argc > i+1;
 
                 if (!strcasecmp(c->argv[i]->ptr,"id") && moreargs) {
-                    long tmp;
+                    long long tmp;
 
-                    if (getRangeLongFromObjectOrReply(c, c->argv[i+1], 1, LONG_MAX, &tmp,
-                                                      "client-id should be greater than 0") != C_OK)
-                        return;
+                    if (getLongLongFromObjectOrReply(c,c->argv[i+1],&tmp,NULL)
+                        != C_OK) return;
                     id = tmp;
                 } else if (!strcasecmp(c->argv[i]->ptr,"type") && moreargs) {
                     type = getClientTypeByName(c->argv[i+1]->ptr);
@@ -2908,7 +2876,7 @@ NULL
             addReplyNull(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"unpause") && c->argc == 2) {
         /* CLIENT UNPAUSE */
-        unpauseClients(PAUSE_BY_CLIENT_COMMAND);
+        unpauseClients();
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"pause") && (c->argc == 3 ||
                                                         c->argc == 4))
@@ -2930,7 +2898,7 @@ NULL
 
         if (getTimeoutFromObjectOrReply(c,c->argv[2],&end,
             UNIT_MILLISECONDS) != C_OK) return;
-        pauseClients(PAUSE_BY_CLIENT_COMMAND, end, type);
+        pauseClients(end, type);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"tracking") && c->argc >= 3) {
         /* CLIENT TRACKING (on|off) [REDIRECT <id>] [BCAST] [PREFIX first]
@@ -3574,48 +3542,6 @@ void flushSlavesOutputBuffers(void) {
     }
 }
 
-/* Compute current most restictive pause type and its end time, aggregated for
- * all pause purposes. */
-static void updateClientPauseTypeAndEndTime(void) {
-    pause_type old_type = server.client_pause_type;
-    pause_type type = CLIENT_PAUSE_OFF;
-    mstime_t end = 0;
-    for (int i = 0; i < NUM_PAUSE_PURPOSES; i++) {
-        pause_event *p = server.client_pause_per_purpose[i];
-        if (p == NULL) {
-            /* Nothing to do. */
-        } else if (p->end < server.mstime) {
-            /* This one expired. */
-            zfree(p);
-            server.client_pause_per_purpose[i] = NULL;
-        } else if (p->type > type) {
-            /* This type is the most restrictive so far. */
-            type = p->type;
-        }
-    }
-
-    /* Find the furthest end time among the pause purposes of the most
-     * restrictive type */
-    for (int i = 0; i < NUM_PAUSE_PURPOSES; i++) {
-        pause_event *p = server.client_pause_per_purpose[i];
-        if (p != NULL && p->type == type && p->end > end) end = p->end;
-    }
-    server.client_pause_type = type;
-    server.client_pause_end_time = end;
-
-    /* If the pause type is less restrictive than before, we unblock all clients
-     * so they are reprocessed (may get re-paused). */
-    if (type < old_type) {
-        listNode *ln;
-        listIter li;
-        listRewind(server.paused_clients, &li);
-        while ((ln = listNext(&li)) != NULL) {
-            client *c = listNodeValue(ln);
-            unblockClient(c);
-        }
-    }
-}
-
 /* Pause clients up to the specified unixtime (in ms) for a given type of
  * commands.
  *
@@ -3629,34 +3555,39 @@ static void updateClientPauseTypeAndEndTime(void) {
  * The function always succeed, even if there is already a pause in progress.
  * In such a case, the duration is set to the maximum and new end time and the
  * type is set to the more restrictive type of pause. */
-void pauseClients(pause_purpose purpose, mstime_t end, pause_type type) {
-    /* Manage pause type and end time per pause purpose. */
-    if (server.client_pause_per_purpose[purpose] == NULL) {
-        server.client_pause_per_purpose[purpose] = zmalloc(sizeof(pause_event));
-        server.client_pause_per_purpose[purpose]->type = type;
-        server.client_pause_per_purpose[purpose]->end = end;
-    } else {
-        pause_event *p = server.client_pause_per_purpose[purpose];
-        p->type = max(p->type, type);
-        p->end = max(p->end, end);
+void pauseClients(mstime_t end, pause_type type) {
+    if (type > server.client_pause_type) {
+        server.client_pause_type = type;
     }
-    updateClientPauseTypeAndEndTime();
+
+    if (end > server.client_pause_end_time) {
+        server.client_pause_end_time = end;
+    }
 
     /* We allow write commands that were queued
      * up before and after to execute. We need
      * to track this state so that we don't assert
-     * in propagateNow(). */
+     * in propagate(). */
     if (server.in_exec) {
         server.client_pause_in_transaction = 1;
     }
 }
 
 /* Unpause clients and queue them for reprocessing. */
-void unpauseClients(pause_purpose purpose) {
-    if (server.client_pause_per_purpose[purpose] == NULL) return;
-    zfree(server.client_pause_per_purpose[purpose]);
-    server.client_pause_per_purpose[purpose] = NULL;
-    updateClientPauseTypeAndEndTime();
+void unpauseClients(void) {
+    listNode *ln;
+    listIter li;
+    client *c;
+    
+    server.client_pause_type = CLIENT_PAUSE_OFF;
+    server.client_pause_end_time = 0;
+
+    /* Unblock all of the clients so they are reprocessed. */
+    listRewind(server.paused_clients,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        c = listNodeValue(ln);
+        unblockClient(c);
+    }
 }
 
 /* Returns true if clients are paused and false otherwise. */ 
@@ -3671,7 +3602,7 @@ int checkClientPauseTimeoutAndReturnIfPaused(void) {
     if (!areClientsPaused())
         return 0;
     if (server.client_pause_end_time < server.mstime) {
-        updateClientPauseTypeAndEndTime();
+        unpauseClients();
     }
     return areClientsPaused();
 }
@@ -3698,11 +3629,8 @@ void processEventsWhileBlocked(void) {
     /* Note: when we are processing events while blocked (for instance during
      * busy Lua scripts), we set a global flag. When such flag is set, we
      * avoid handling the read part of clients using threaded I/O.
-     * See https://github.com/redis/redis/issues/6988 for more info.
-     * Note that there could be cases of nested calls to this function,
-     * specifically on a busy script during async_loading rdb, and scripts
-     * that came from AOF. */
-    ProcessingEventsWhileBlocked++;
+     * See https://github.com/redis/redis/issues/6988 for more info. */
+    ProcessingEventsWhileBlocked = 1;
     while (iterations--) {
         long long startval = server.events_processed_while_blocked;
         long long ae_events = aeProcessEvents(server.el,
@@ -3717,8 +3645,7 @@ void processEventsWhileBlocked(void) {
 
     whileBlockedCron();
 
-    ProcessingEventsWhileBlocked--;
-    serverAssert(ProcessingEventsWhileBlocked >= 0);
+    ProcessingEventsWhileBlocked = 0;
 }
 
 /* ==========================================================================

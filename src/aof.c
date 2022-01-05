@@ -30,7 +30,6 @@
 #include "server.h"
 #include "bio.h"
 #include "rio.h"
-#include "functions.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -628,8 +627,6 @@ sds genAofTimestampAnnotationIfNeeded(int force) {
 void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
     sds buf = sdsempty();
 
-    serverAssert(dictid >= 0 && dictid < server.dbnum);
-
     /* Feed timestamp if needed */
     if (server.aof_timestamp_enabled) {
         sds ts = genAofTimestampAnnotationIfNeeded(0);
@@ -740,8 +737,7 @@ int loadAppendOnlyFile(char *filename) {
      * to the same file we're about to read. */
     server.aof_state = AOF_OFF;
 
-    client *old_client = server.current_client;
-    fakeClient = server.current_client = createAOFClient();
+    fakeClient = createAOFClient();
     startLoadingFile(fp, filename, RDBFLAGS_AOF_PREAMBLE);
 
     /* Check if this AOF file has an RDB preamble. In that case we need to
@@ -757,8 +753,7 @@ int loadAppendOnlyFile(char *filename) {
         serverLog(LL_NOTICE,"Reading RDB preamble from AOF file...");
         if (fseek(fp,0,SEEK_SET) == -1) goto readerr;
         rioInitWithFile(&rdb,fp);
-
-        if (rdbLoadRio(&rdb,RDBFLAGS_AOF_PREAMBLE,NULL) != C_OK) {
+        if (rdbLoadRio(&rdb,RDBFLAGS_AOF_PREAMBLE,NULL,server.db) != C_OK) {
             serverLog(LL_WARNING,"Error reading the RDB preamble of the AOF file, AOF loading aborted");
             goto readerr;
         } else {
@@ -933,7 +928,6 @@ fmterr: /* Format error. */
 
 cleanup:
     if (fakeClient) freeClient(fakeClient);
-    server.current_client = old_client;
     fclose(fp);
     stopLoading(ret == AOF_OK);
     return ret;
@@ -1509,10 +1503,6 @@ int rewriteAppendOnlyFileRio(rio *aof) {
                     updated_time = now;
                 }
             }
-
-            /* Delay before next key if required (for testing) */
-            if (server.rdb_key_save_delay)
-                debugDelay(server.rdb_key_save_delay);
         }
         dictReleaseIterator(di);
         di = NULL;
@@ -1556,7 +1546,7 @@ int rewriteAppendOnlyFile(char *filename) {
 
     if (server.aof_use_rdb_preamble) {
         int error;
-        if (rdbSaveRio(SLAVE_REQ_NONE,&aof,&error,RDBFLAGS_AOF_PREAMBLE,NULL) == C_ERR) {
+        if (rdbSaveRio(&aof,&error,RDBFLAGS_AOF_PREAMBLE,NULL) == C_ERR) {
             errno = error;
             goto werr;
         }
@@ -1783,6 +1773,7 @@ int rewriteAppendOnlyFileBackground(void) {
          * accumulated by the parent into server.aof_rewrite_buf will start
          * with a SELECT statement and it will be safe to merge. */
         server.aof_selected_db = -1;
+        replicationScriptCacheFlush();
         return C_OK;
     }
     return C_OK; /* unreached */

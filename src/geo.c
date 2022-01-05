@@ -128,17 +128,17 @@ int longLatFromMember(robj *zobj, robj *member, double *xy) {
 double extractUnitOrReply(client *c, robj *unit) {
     char *u = unit->ptr;
 
-    if (!strcasecmp(u, "m")) {
+    if (!strcmp(u, "m")) {
         return 1;
-    } else if (!strcasecmp(u, "km")) {
+    } else if (!strcmp(u, "km")) {
         return 1000;
-    } else if (!strcasecmp(u, "ft")) {
+    } else if (!strcmp(u, "ft")) {
         return 0.3048;
-    } else if (!strcasecmp(u, "mi")) {
+    } else if (!strcmp(u, "mi")) {
         return 1609.34;
     } else {
         addReplyError(c,
-            "unsupported unit provided. please use M, KM, FT, MI");
+            "unsupported unit provided. please use m, km, ft, mi");
         return -1;
     }
 }
@@ -444,7 +444,7 @@ void geoaddCommand(client *c) {
         char *opt = c->argv[longidx]->ptr;
         if (!strcasecmp(opt,"nx")) nx = 1;
         else if (!strcasecmp(opt,"xx")) xx = 1;
-        else if (!strcasecmp(opt,"ch")) { /* Handle in zaddCommand. */ }
+        else if (!strcasecmp(opt,"ch")) {}
         else break;
         longidx++;
     }

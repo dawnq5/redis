@@ -1,3 +1,4 @@
+#define REDISMODULE_EXPERIMENTAL_API
 #define _XOPEN_SOURCE 700
 #include "redismodule.h"
 #include <stdio.h>

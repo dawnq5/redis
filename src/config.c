@@ -45,12 +45,6 @@ typedef struct configEnum {
     const int val;
 } configEnum;
 
-typedef struct deprecatedConfig {
-    const char *name;
-    const int argc_min;
-    const int argc_max;
-} deprecatedConfig;
-
 configEnum maxmemory_policy_enum[] = {
     {"volatile-lru", MAXMEMORY_VOLATILE_LRU},
     {"volatile-lfu", MAXMEMORY_VOLATILE_LFU},
@@ -134,20 +128,6 @@ configEnum sanitize_dump_payload_enum[] = {
     {NULL, 0}
 };
 
-configEnum protected_action_enum[] = {
-    {"no", PROTECTED_ACTION_ALLOWED_NO},
-    {"yes", PROTECTED_ACTION_ALLOWED_YES},
-    {"local", PROTECTED_ACTION_ALLOWED_LOCAL},
-    {NULL, 0}
-};
-
-configEnum cluster_preferred_endpoint_type_enum[] = {
-    {"ip", CLUSTER_ENDPOINT_TYPE_IP},
-    {"hostname", CLUSTER_ENDPOINT_TYPE_HOSTNAME},
-    {"unknown-endpoint", CLUSTER_ENDPOINT_TYPE_UNKNOWN_ENDPOINT},
-    {NULL, 0}
-};
-
 /* Output buffer limits presets. */
 clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
     {0, 0, 0}, /* normal */
@@ -162,6 +142,12 @@ int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT] = { 0, 200, 800 };
  * int is_valid_fn(val, err)
  *     Return 1 when val is valid, and 0 when invalid.
  *     Optionally set err to a static error string.
+ * int update_fn(val, prev, err)
+ *     This function is called only for CONFIG SET command (not at config file parsing)
+ *     It is called after the actual config is applied,
+ *     Return 1 for success, and 0 for failure.
+ *     Optionally set err to a static error string.
+ *     On failure the config change will be reverted.
  */
 
 /* Configuration values that require no special handling to set, get, load or
@@ -170,12 +156,14 @@ typedef struct boolConfigData {
     int *config; /* The pointer to the server config this value is stored in */
     const int default_value; /* The default value of the config on rewrite */
     int (*is_valid_fn)(int val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int (*update_fn)(int val, int prev, const char **err); /* Optional function to apply new value at runtime (generic doc above) */
 } boolConfigData;
 
 typedef struct stringConfigData {
     char **config; /* Pointer to the server config this value is stored in. */
     const char *default_value; /* Default value of the config on rewrite. */
     int (*is_valid_fn)(char* val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int (*update_fn)(char* val, char* prev, const char **err); /* Optional function to apply new value at runtime (generic doc above) */
     int convert_empty_to_null; /* Boolean indicating if empty strings should
                                   be stored as a NULL value. */
 } stringConfigData;
@@ -184,6 +172,7 @@ typedef struct sdsConfigData {
     sds *config; /* Pointer to the server config this value is stored in. */
     const char *default_value; /* Default value of the config on rewrite. */
     int (*is_valid_fn)(sds val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int (*update_fn)(sds val, sds prev, const char **err); /* Optional function to apply new value at runtime (generic doc above) */
     int convert_empty_to_null; /* Boolean indicating if empty SDS strings should
                                   be stored as a NULL value. */
 } sdsConfigData;
@@ -193,6 +182,7 @@ typedef struct enumConfigData {
     configEnum *enum_value; /* The underlying enum type this data represents */
     const int default_value; /* The default value of the config on rewrite */
     int (*is_valid_fn)(int val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int (*update_fn)(int val, int prev, const char **err); /* Optional function to apply new value at runtime (generic doc above) */
 } enumConfigData;
 
 typedef enum numericType {
@@ -232,6 +222,7 @@ typedef struct numericConfigData {
     long long upper_bound; /* The upper bound of this numeric value */
     const long long default_value; /* The default value of the config on rewrite */
     int (*is_valid_fn)(long long val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int (*update_fn)(long long val, long long prev, const char **err); /* Optional function to apply new value at runtime (generic doc above) */
 } numericConfigData;
 
 typedef union typeData {
@@ -242,20 +233,14 @@ typedef union typeData {
     numericConfigData numeric;
 } typeData;
 
-typedef int (*apply_fn)(const char **err);
 typedef struct typeInterface {
     /* Called on server start, to init the server with default value */
     void (*init)(typeData data);
-    /* Called on server startup and CONFIG SET, returns 1 on success,
-     * 2 meaning no actual change done, 0 on error and can set a verbose err
-     * string */
-    int (*set)(typeData data, sds *argv, int argc, const char **err);
-    /* Optional: called after `set()` to apply the config change. Used only in
-     * the context of CONFIG SET. Returns 1 on success, 0 on failure.
-     * Optionally set err to a static error string. */
-    apply_fn apply;
-    /* Called on CONFIG GET, returns sds to be used in reply */
-    sds (*get)(typeData data);
+    /* Called on server startup and CONFIG SET, returns 1 on success, 0 on error
+     * and can set a verbose err string, update is true when called from CONFIG SET */
+    int (*set)(typeData data, sds *argv, int argc, int update, const char **err);
+    /* Called on CONFIG GET, required to add output to the client */
+    void (*get)(client *c, typeData data);
     /* Called on CONFIG REWRITE, required to rewrite the config state */
     void (*rewrite)(typeData data, const char *name, struct rewriteConfigState *state);
 } typeInterface;
@@ -274,9 +259,6 @@ typedef struct standardConfig {
 #define SENSITIVE_CONFIG (1ULL<<1) /* Does this value contain sensitive information */
 #define DEBUG_CONFIG (1ULL<<2) /* Values that are useful for debugging. */
 #define MULTI_ARG_CONFIG (1ULL<<3) /* This config receives multiple arguments. */
-#define HIDDEN_CONFIG (1ULL<<4) /* This config is hidden in `config get <pattern>` (used for tests/debugging) */
-#define PROTECTED_CONFIG (1ULL<<5) /* Becomes immutable if enable-protected-configs is enabled. */
-#define DENY_LOADING_CONFIG (1ULL<<6) /* This config is forbidden during loading. */
 
 standardConfig configs[];
 
@@ -351,6 +333,63 @@ void queueLoadModule(sds path, sds *argv, int argc) {
     listAddNodeTail(server.loadmodule_queue,loadmod);
 }
 
+/* Parse an array of CONFIG_OOM_COUNT sds strings, validate and populate
+ * server.oom_score_adj_values if valid.
+ */
+
+static int updateOOMScoreAdjValues(sds *args, const char **err, int apply) {
+    int i;
+    int values[CONFIG_OOM_COUNT];
+
+    for (i = 0; i < CONFIG_OOM_COUNT; i++) {
+        char *eptr;
+        long long val = strtoll(args[i], &eptr, 10);
+
+        if (*eptr != '\0' || val < -2000 || val > 2000) {
+            if (err) *err = "Invalid oom-score-adj-values, elements must be between -2000 and 2000.";
+            return C_ERR;
+        }
+
+        values[i] = val;
+    }
+
+    /* Verify that the values make sense. If they don't omit a warning but
+     * keep the configuration, which may still be valid for privileged processes.
+     */
+
+    if (values[CONFIG_OOM_REPLICA] < values[CONFIG_OOM_MASTER] ||
+        values[CONFIG_OOM_BGCHILD] < values[CONFIG_OOM_REPLICA]) {
+            serverLog(LL_WARNING,
+                    "The oom-score-adj-values configuration may not work for non-privileged processes! "
+                    "Please consult the documentation.");
+    }
+
+    /* Store values, retain previous config for rollback in case we fail. */
+    int old_values[CONFIG_OOM_COUNT];
+    for (i = 0; i < CONFIG_OOM_COUNT; i++) {
+        old_values[i] = server.oom_score_adj_values[i];
+        server.oom_score_adj_values[i] = values[i];
+    }
+    
+    /* When parsing the config file, we want to apply only when all is done. */
+    if (!apply)
+        return C_OK;
+
+    /* Update */
+    if (setOOMScoreAdj(-1) == C_ERR) {
+        /* Roll back */
+        for (i = 0; i < CONFIG_OOM_COUNT; i++)
+            server.oom_score_adj_values[i] = old_values[i];
+
+        if (err)
+            *err = "Failed to apply oom-score-adj-values configuration, check server logs.";
+
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
 /* Parse an array of `arg_len` sds strings, validate and populate
  * server.client_obuf_limits if valid.
  * Used in CONFIG SET and configuration file parsing. */
@@ -413,24 +452,12 @@ void initConfigValues() {
     }
 }
 
-/* Note this is here to support detecting we're running a config set from
- * within conf file parsing. This is only needed to support the deprecated
- * abnormal aggregate `save T C` functionality. Remove in the future. */
-static int reading_config_file;
-
 void loadServerConfigFromString(char *config) {
-    deprecatedConfig deprecated_configs[] = {
-        {"list-max-ziplist-entries", 2, 2},
-        {"list-max-ziplist-value", 2, 2},
-        {"lua-replicate-commands", 2, 2},
-        {NULL, 0},
-    };
     char buf[1024];
     const char *err = NULL;
     int linenum = 0, totlines, i;
     sds *lines;
 
-    reading_config_file = 1;
     lines = sdssplitlen(config,strlen(config),"\n",1,&totlines);
 
     for (i = 0; i < totlines; i++) {
@@ -470,25 +497,12 @@ void loadServerConfigFromString(char *config) {
                     goto loaderr;
                 }
                 /* Set config using all arguments that follows */
-                if (!config->interface.set(config->data, &argv[1], argc-1, &err)) {
+                if (!config->interface.set(config->data, &argv[1], argc-1, 0, &err)) {
                     goto loaderr;
                 }
 
                 match = 1;
                 break;
-            }
-        }
-
-        /* If there's no matching above, we try matching them with deprecated configs */
-        if (!match) {
-            for (deprecatedConfig *config = deprecated_configs; config->name != NULL; config++) {
-                if (!strcasecmp(argv[0], config->name) && 
-                    config->argc_min <= argc && 
-                    argc <= config->argc_max) 
-                {
-                    match = 1;
-                    break;
-                }
             }
         }
 
@@ -500,6 +514,10 @@ void loadServerConfigFromString(char *config) {
         /* Execute config directives */
         if (!strcasecmp(argv[0],"include") && argc == 2) {
             loadServerConfig(argv[1], 0, NULL);
+        } else if (!strcasecmp(argv[0],"list-max-ziplist-entries") && argc == 2){
+            /* DEAD OPTION */
+        } else if (!strcasecmp(argv[0],"list-max-ziplist-value") && argc == 2) {
+            /* DEAD OPTION */
         } else if (!strcasecmp(argv[0],"rename-command") && argc == 3) {
             struct redisCommand *cmd = lookupCommandBySds(argv[1]);
             int retval;
@@ -576,7 +594,6 @@ void loadServerConfigFromString(char *config) {
     if (server.config_hz > CONFIG_MAX_HZ) server.config_hz = CONFIG_MAX_HZ;
 
     sdsfreesplitres(lines,totlines);
-    reading_config_file = 0;
     return;
 
 loaderr:
@@ -670,187 +687,63 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
     sdsfree(config);
 }
 
-static int performInterfaceSet(standardConfig *config, sds value, const char **errstr) {
-    sds *argv;
-    int argc, res;
-
-    if (config->flags & MULTI_ARG_CONFIG) {
-        argv = sdssplitlen(value, sdslen(value), " ", 1, &argc);
-    } else {
-        argv = (char**)&value;
-        argc = 1;
-    }
-
-    /* Set the config */
-    res = config->interface.set(config->data, argv, argc, errstr);
-    if (config->flags & MULTI_ARG_CONFIG) sdsfreesplitres(argv, argc);
-    return res;
-}
-
-static void restoreBackupConfig(standardConfig **set_configs, sds *old_values, int count, apply_fn *apply_fns) {
-    int i;
-    const char *errstr = "unknown error";
-    /* Set all backup values */
-    for (i = 0; i < count; i++) {
-        if (!performInterfaceSet(set_configs[i], old_values[i], &errstr))
-            serverLog(LL_WARNING, "Failed restoring failed CONFIG SET command. Error setting %s to '%s': %s",
-                      set_configs[i]->name, old_values[i], errstr);
-    }
-    /* Apply backup */
-    if (apply_fns) {
-        for (i = 0; i < count && apply_fns[i] != NULL; i++) {
-            if (!apply_fns[i](&errstr))
-                serverLog(LL_WARNING, "Failed applying restored failed CONFIG SET command: %s", errstr);
-        }
-    }
-}
-
 /*-----------------------------------------------------------------------------
  * CONFIG SET implementation
  *----------------------------------------------------------------------------*/
-
 void configSetCommand(client *c) {
+    robj *o;
+    sds *argv;
+    int argc;
     const char *errstr = NULL;
-    const char *invalid_arg_name = NULL;
-    const char *err_arg_name = NULL;
-    standardConfig **set_configs; /* TODO: make this a dict for better performance */
-    sds *new_values;
-    sds *old_values = NULL;
-    apply_fn *apply_fns; /* TODO: make this a set for better performance */
-    int config_count, i, j;
-    int invalid_args = 0, deny_loading_error = 0;
-    int *config_map_fns;
+    serverAssertWithInfo(c,c->argv[2],sdsEncodedObject(c->argv[2]));
+    serverAssertWithInfo(c,c->argv[3],sdsEncodedObject(c->argv[3]));
+    o = c->argv[3];
 
-    /* Make sure we have an even number of arguments: conf-val pairs */
-    if (c->argc & 1) {
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
-    }
-    config_count = (c->argc - 2) / 2;
-
-    set_configs = zcalloc(sizeof(standardConfig*)*config_count);
-    new_values = zmalloc(sizeof(sds*)*config_count);
-    old_values = zcalloc(sizeof(sds*)*config_count);
-    apply_fns = zcalloc(sizeof(apply_fn)*config_count);
-    config_map_fns = zmalloc(sizeof(int)*config_count);
-
-    /* Find all relevant configs */
-    for (i = 0; i < config_count; i++) {
-        for (standardConfig *config = configs; config->name != NULL; config++) {
-            if ((!strcasecmp(c->argv[2+i*2]->ptr,config->name) ||
-                 (config->alias && !strcasecmp(c->argv[2]->ptr,config->alias)))) {
-
-                /* Note: it's important we run over ALL passed configs and check if we need to call `redactClientCommandArgument()`.
-                 * This is in order to avoid anyone using this command for a log/slowlog/monitor/etc. displaying sensitive info.
-                 * So even if we encounter an error we still continue running over the remaining arguments. */
-                if (config->flags & SENSITIVE_CONFIG) {
-                    redactClientCommandArgument(c,2+i*2+1);
-                }
-
-                if (!invalid_args) {
-                    if (config->flags & IMMUTABLE_CONFIG ||
-                        (config->flags & PROTECTED_CONFIG && !allowProtectedAction(server.enable_protected_configs, c)))
-                    {
-                        /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
-                        errstr = (config->flags & IMMUTABLE_CONFIG) ? "can't set immutable config" : "can't set protected config";
-                        err_arg_name = c->argv[2+i*2]->ptr;
-                        invalid_args = 1;
-                    }
-
-                    if (server.loading && config->flags & DENY_LOADING_CONFIG) {
-                        /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
-                        deny_loading_error = 1;
-                        invalid_args = 1;
-                    }
-
-                    /* If this config appears twice then fail */
-                    for (j = 0; j < i; j++) {
-                        if (set_configs[j] == config) {
-                            /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
-                            errstr = "duplicate parameter";
-                            err_arg_name = c->argv[2+i*2]->ptr;
-                            invalid_args = 1;
-                            break;
-                        }
-                    }
-                    set_configs[i] = config;
-                    new_values[i] = c->argv[2+i*2+1]->ptr;
-                }
-                break;
+    /* Iterate the configs that are standard */
+    for (standardConfig *config = configs; config->name != NULL; config++) {
+        if (!(config->flags & IMMUTABLE_CONFIG) && 
+            (!strcasecmp(c->argv[2]->ptr,config->name) ||
+            (config->alias && !strcasecmp(c->argv[2]->ptr,config->alias))))
+        {
+            if (config->flags & SENSITIVE_CONFIG) {
+                redactClientCommandArgument(c,3);
             }
-        }
-        /* Fail if we couldn't find this config */
-        /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
-        if (!invalid_args && !set_configs[i]) {
-            invalid_arg_name = c->argv[2+i*2]->ptr;
-            invalid_args = 1;
-        }
-    }
-    
-    if (invalid_args) goto err;
 
-    /* Backup old values before setting new ones */
-    for (i = 0; i < config_count; i++)
-        old_values[i] = set_configs[i]->interface.get(set_configs[i]->data);
-
-    /* Set all new values (don't apply yet) */
-    for (i = 0; i < config_count; i++) {
-        int res = performInterfaceSet(set_configs[i], new_values[i], &errstr);
-        if (!res) {
-            restoreBackupConfig(set_configs, old_values, i+1, NULL);
-            err_arg_name = set_configs[i]->name;
-            goto err;
-        } else if (res == 1) {
-            /* A new value was set, if this config has an apply function then store it for execution later */
-            if (set_configs[i]->interface.apply) {
-                /* Check if this apply function is already stored */
-                int exists = 0;
-                for (j = 0; apply_fns[j] != NULL && j <= i; j++) {
-                    if (apply_fns[j] == set_configs[i]->interface.apply) {
-                        exists = 1;
-                        break;
-                    }
+            if (config->flags & MULTI_ARG_CONFIG) {
+                argv = sdssplitlen(o->ptr, sdslen(o->ptr), " ", 1, &argc);
+                if (argv == NULL) {
+                    goto badfmt;
                 }
-                /* Apply function not stored, store it */
-                if (!exists) {
-                    apply_fns[j] = set_configs[i]->interface.apply;
-                    config_map_fns[j] = i;
-                }
+            } else {
+               argv = (char**)&o->ptr;
+               argc = 1;
             }
+
+            if (!config->interface.set(config->data, argv, argc, 1, &errstr)) {
+                if (config->flags & MULTI_ARG_CONFIG) sdsfreesplitres(argv, argc);
+                goto badfmt;
+            }
+            if (config->flags & MULTI_ARG_CONFIG) sdsfreesplitres(argv, argc);
+            addReply(c,shared.ok);
+            return;
         }
     }
 
-    /* Apply all configs after being set */
-    for (i = 0; i < config_count && apply_fns[i] != NULL; i++) {
-        if (!apply_fns[i](&errstr)) {
-            serverLog(LL_WARNING, "Failed applying new configuration. Possibly related to new %s setting. Restoring previous settings.", set_configs[config_map_fns[i]]->name);
-            restoreBackupConfig(set_configs, old_values, config_count, apply_fns);
-            err_arg_name = set_configs[config_map_fns[i]]->name;
-            goto err;
-        }
-    }
-    addReply(c,shared.ok);
-    goto end;
+    addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
+        (char*)c->argv[2]->ptr);
+    return;
 
-err:
-    if (deny_loading_error) {
-        /* We give the loading error precedence because it may be handled by clients differently, unlike a plain -ERR. */
-        addReplyErrorObject(c,shared.loadingerr);
-    } else if (invalid_arg_name) {
-        addReplyErrorFormat(c,"Unknown option or number of arguments for CONFIG SET - '%s'", invalid_arg_name);
-    } else if (errstr) {
-        addReplyErrorFormat(c,"CONFIG SET failed (possibly related to argument '%s') - %s", err_arg_name, errstr);
+badfmt: /* Bad format errors */
+    if (errstr) {
+        addReplyErrorFormat(c,"Invalid argument '%s' for CONFIG SET '%s' - %s",
+                (char*)o->ptr,
+                (char*)c->argv[2]->ptr,
+                errstr);
     } else {
-        addReplyErrorFormat(c,"CONFIG SET failed (possibly related to argument '%s')", err_arg_name);
+        addReplyErrorFormat(c,"Invalid argument '%s' for CONFIG SET '%s'",
+                (char*)o->ptr,
+                (char*)c->argv[2]->ptr);
     }
-end:
-    zfree(set_configs);
-    zfree(new_values);
-    for (i = 0; i < config_count; i++)
-        sdsfree(old_values[i]);
-    zfree(old_values);
-    zfree(apply_fns);
-    zfree(config_map_fns);
 }
 
 /*-----------------------------------------------------------------------------
@@ -858,34 +751,22 @@ end:
  *----------------------------------------------------------------------------*/
 
 void configGetCommand(client *c) {
+    robj *o = c->argv[2];
     void *replylen = addReplyDeferredLen(c);
+    char *pattern = o->ptr;
     int matches = 0;
-    int i;
+    serverAssertWithInfo(c,o,sdsEncodedObject(o));
 
     for (standardConfig *config = configs; config->name != NULL; config++) {
-        int matched_conf = 0;
-        int matched_alias = 0;
-        for (i = 0; i < c->argc - 2 && (!matched_conf || !matched_alias); i++) {
-            robj *o = c->argv[2+i];
-            char *pattern = o->ptr;
-
-            /* Note that hidden configs require an exact match (not a pattern) */
-            if (!matched_conf &&
-                (((config->flags & HIDDEN_CONFIG) && !strcasecmp(pattern, config->name)) ||
-                 (!(config->flags & HIDDEN_CONFIG) && stringmatch(pattern, config->name, 1)))) {
-                addReplyBulkCString(c, config->name);
-                addReplyBulkSds(c, config->interface.get(config->data));
-                matches++;
-                matched_conf = 1;
-            }
-            if (!matched_alias && config->alias &&
-                (((config->flags & HIDDEN_CONFIG) && !strcasecmp(pattern, config->alias)) ||
-                 (!(config->flags & HIDDEN_CONFIG) && stringmatch(pattern, config->alias, 1)))) {
-                addReplyBulkCString(c, config->alias);
-                addReplyBulkSds(c, config->interface.get(config->data));
-                matches++;
-                matched_alias = 1;
-            }
+        if (stringmatch(pattern,config->name,1)) {
+            addReplyBulkCString(c,config->name);
+            config->interface.get(c,config->data);
+            matches++;
+        }
+        if (config->alias && stringmatch(pattern,config->alias,1)) {
+            addReplyBulkCString(c,config->alias);
+            config->interface.get(c,config->data);
+            matches++;
         }
     }
 
@@ -1635,12 +1516,11 @@ static char loadbuf[LOADBUF_SIZE];
     .alias = (config_alias), \
     .flags = (config_flags),
 
-#define embedConfigInterface(initfn, setfn, getfn, rewritefn, applyfn) .interface = { \
+#define embedConfigInterface(initfn, setfn, getfn, rewritefn) .interface = { \
     .init = (initfn), \
     .set = (setfn), \
     .get = (getfn), \
-    .rewrite = (rewritefn), \
-    .apply = (applyfn) \
+    .rewrite = (rewritefn) \
 },
 
 /* What follows is the generic config types that are supported. To add a new
@@ -1660,7 +1540,7 @@ static void boolConfigInit(typeData data) {
     *data.yesno.config = data.yesno.default_value;
 }
 
-static int boolConfigSet(typeData data, sds *argv, int argc, const char **err) {
+static int boolConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(argc);
     int yn = yesnotoi(argv[0]);
     if (yn == -1) {
@@ -1670,28 +1550,30 @@ static int boolConfigSet(typeData data, sds *argv, int argc, const char **err) {
     if (data.yesno.is_valid_fn && !data.yesno.is_valid_fn(yn, err))
         return 0;
     int prev = *(data.yesno.config);
-    if (prev != yn) {
-        *(data.yesno.config) = yn;
-        return 1;
+    *(data.yesno.config) = yn;
+    if (update && data.yesno.update_fn && !data.yesno.update_fn(yn, prev, err)) {
+        *(data.yesno.config) = prev;
+        return 0;
     }
-    return 2;
+    return 1;
 }
 
-static sds boolConfigGet(typeData data) {
-    return sdsnew(*data.yesno.config ? "yes" : "no");
+static void boolConfigGet(client *c, typeData data) {
+    addReplyBulkCString(c, *data.yesno.config ? "yes" : "no");
 }
 
 static void boolConfigRewrite(typeData data, const char *name, struct rewriteConfigState *state) {
     rewriteConfigYesNoOption(state, name,*(data.yesno.config), data.yesno.default_value);
 }
 
-#define createBoolConfig(name, alias, flags, config_addr, default, is_valid, apply) { \
+#define createBoolConfig(name, alias, flags, config_addr, default, is_valid, update) { \
     embedCommonConfig(name, alias, flags) \
-    embedConfigInterface(boolConfigInit, boolConfigSet, boolConfigGet, boolConfigRewrite, apply) \
+    embedConfigInterface(boolConfigInit, boolConfigSet, boolConfigGet, boolConfigRewrite) \
     .data.yesno = { \
         .config = &(config_addr), \
         .default_value = (default), \
         .is_valid_fn = (is_valid), \
+        .update_fn = (update), \
     } \
 }
 
@@ -1700,22 +1582,23 @@ static void stringConfigInit(typeData data) {
     *data.string.config = (data.string.convert_empty_to_null && !data.string.default_value) ? NULL : zstrdup(data.string.default_value);
 }
 
-static int stringConfigSet(typeData data, sds *argv, int argc, const char **err) {
+static int stringConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(argc);
     if (data.string.is_valid_fn && !data.string.is_valid_fn(argv[0], err))
         return 0;
     char *prev = *data.string.config;
-    char *new = (data.string.convert_empty_to_null && !argv[0][0]) ? NULL : argv[0];
-    if (new != prev && (new == NULL || prev == NULL || strcmp(prev, new))) {
-        *data.string.config = new != NULL ? zstrdup(new) : NULL;
-        zfree(prev);
-        return 1;
+    *data.string.config = (data.string.convert_empty_to_null && !argv[0][0]) ? NULL : zstrdup(argv[0]);
+    if (update && data.string.update_fn && !data.string.update_fn(*data.string.config, prev, err)) {
+        zfree(*data.string.config);
+        *data.string.config = prev;
+        return 0;
     }
-    return 2;
+    zfree(prev);
+    return 1;
 }
 
-static sds stringConfigGet(typeData data) {
-    return sdsnew(*data.string.config ? *data.string.config : "");
+static void stringConfigGet(client *c, typeData data) {
+    addReplyBulkCString(c, *data.string.config ? *data.string.config : "");
 }
 
 static void stringConfigRewrite(typeData data, const char *name, struct rewriteConfigState *state) {
@@ -1727,25 +1610,26 @@ static void sdsConfigInit(typeData data) {
     *data.sds.config = (data.sds.convert_empty_to_null && !data.sds.default_value) ? NULL: sdsnew(data.sds.default_value);
 }
 
-static int sdsConfigSet(typeData data, sds *argv, int argc, const char **err) {
+static int sdsConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(argc);
     if (data.sds.is_valid_fn && !data.sds.is_valid_fn(argv[0], err))
         return 0;
     sds prev = *data.sds.config;
-    sds new = (data.string.convert_empty_to_null && (sdslen(argv[0]) == 0)) ? NULL : argv[0];
-    if (new != prev && (new == NULL || prev == NULL || sdscmp(prev, new))) {
-        *data.sds.config = new != NULL ? sdsdup(new) : NULL;
-        sdsfree(prev);
-        return 1;
+    *data.sds.config = (data.sds.convert_empty_to_null && (sdslen(argv[0]) == 0)) ? NULL : sdsdup(argv[0]);
+    if (update && data.sds.update_fn && !data.sds.update_fn(*data.sds.config, prev, err)) {
+        sdsfree(*data.sds.config);
+        *data.sds.config = prev;
+        return 0;
     }
-    return 2;
+    sdsfree(prev);
+    return 1;
 }
 
-static sds sdsConfigGet(typeData data) {
+static void sdsConfigGet(client *c, typeData data) {
     if (*data.sds.config) {
-        return sdsdup(*data.sds.config);
+        addReplyBulkSds(c, sdsdup(*data.sds.config));
     } else {
-        return sdsnew("");
+        addReplyBulkCString(c, "");
     }
 }
 
@@ -1757,24 +1641,26 @@ static void sdsConfigRewrite(typeData data, const char *name, struct rewriteConf
 #define ALLOW_EMPTY_STRING 0
 #define EMPTY_STRING_IS_NULL 1
 
-#define createStringConfig(name, alias, flags, empty_to_null, config_addr, default, is_valid, apply) { \
+#define createStringConfig(name, alias, flags, empty_to_null, config_addr, default, is_valid, update) { \
     embedCommonConfig(name, alias, flags) \
-    embedConfigInterface(stringConfigInit, stringConfigSet, stringConfigGet, stringConfigRewrite, apply) \
+    embedConfigInterface(stringConfigInit, stringConfigSet, stringConfigGet, stringConfigRewrite) \
     .data.string = { \
         .config = &(config_addr), \
         .default_value = (default), \
         .is_valid_fn = (is_valid), \
+        .update_fn = (update), \
         .convert_empty_to_null = (empty_to_null), \
     } \
 }
 
-#define createSDSConfig(name, alias, flags, empty_to_null, config_addr, default, is_valid, apply) { \
+#define createSDSConfig(name, alias, flags, empty_to_null, config_addr, default, is_valid, update) { \
     embedCommonConfig(name, alias, flags) \
-    embedConfigInterface(sdsConfigInit, sdsConfigSet, sdsConfigGet, sdsConfigRewrite, apply) \
+    embedConfigInterface(sdsConfigInit, sdsConfigSet, sdsConfigGet, sdsConfigRewrite) \
     .data.sds = { \
         .config = &(config_addr), \
         .default_value = (default), \
         .is_valid_fn = (is_valid), \
+        .update_fn = (update), \
         .convert_empty_to_null = (empty_to_null), \
     } \
 }
@@ -1784,7 +1670,7 @@ static void enumConfigInit(typeData data) {
     *data.enumd.config = data.enumd.default_value;
 }
 
-static int enumConfigSet(typeData data, sds *argv, int argc, const char **err) {
+static int enumConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(argc);
     int enumval = configEnumGetValue(data.enumd.enum_value, argv[0]);
     if (enumval == INT_MIN) {
@@ -1808,28 +1694,30 @@ static int enumConfigSet(typeData data, sds *argv, int argc, const char **err) {
     if (data.enumd.is_valid_fn && !data.enumd.is_valid_fn(enumval, err))
         return 0;
     int prev = *(data.enumd.config);
-    if (prev != enumval) {
-        *(data.enumd.config) = enumval;
-        return 1;
+    *(data.enumd.config) = enumval;
+    if (update && data.enumd.update_fn && !data.enumd.update_fn(enumval, prev, err)) {
+        *(data.enumd.config) = prev;
+        return 0;
     }
-    return 2;
+    return 1;
 }
 
-static sds enumConfigGet(typeData data) {
-    return sdsnew(configEnumGetNameOrUnknown(data.enumd.enum_value,*data.enumd.config));
+static void enumConfigGet(client *c, typeData data) {
+    addReplyBulkCString(c, configEnumGetNameOrUnknown(data.enumd.enum_value,*data.enumd.config));
 }
 
 static void enumConfigRewrite(typeData data, const char *name, struct rewriteConfigState *state) {
     rewriteConfigEnumOption(state, name,*(data.enumd.config), data.enumd.enum_value, data.enumd.default_value);
 }
 
-#define createEnumConfig(name, alias, flags, enum, config_addr, default, is_valid, apply) { \
+#define createEnumConfig(name, alias, flags, enum, config_addr, default, is_valid, update) { \
     embedCommonConfig(name, alias, flags) \
-    embedConfigInterface(enumConfigInit, enumConfigSet, enumConfigGet, enumConfigRewrite, apply) \
+    embedConfigInterface(enumConfigInit, enumConfigSet, enumConfigGet, enumConfigRewrite) \
     .data.enumd = { \
         .config = &(config_addr), \
         .default_value = (default), \
         .is_valid_fn = (is_valid), \
+        .update_fn = (update), \
         .enum_value = (enum), \
     } \
 }
@@ -1981,7 +1869,7 @@ static int numericParseString(typeData data, sds value, const char **err, long l
     return 0;
 }
 
-static int numericConfigSet(typeData data, sds *argv, int argc, const char **err) {
+static int numericConfigSet(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(argc);
     long long ll, prev = 0;
 
@@ -1995,15 +1883,16 @@ static int numericConfigSet(typeData data, sds *argv, int argc, const char **err
         return 0;
 
     GET_NUMERIC_TYPE(prev)
-    if (prev != ll) {
-        SET_NUMERIC_TYPE(ll)
-        return 1;
-    }
+    SET_NUMERIC_TYPE(ll)
 
-    return 2;
+    if (update && data.numeric.update_fn && !data.numeric.update_fn(ll, prev, err)) {
+        SET_NUMERIC_TYPE(prev)
+        return 0;
+    }
+    return 1;
 }
 
-static sds numericConfigGet(typeData data) {
+static void numericConfigGet(client *c, typeData data) {
     char buf[128];
 
     long long value = 0;
@@ -2021,7 +1910,7 @@ static sds numericConfigGet(typeData data) {
     } else {
         ll2string(buf, sizeof(buf), value);
     }
-    return sdsnew(buf);
+    addReplyBulkCString(c, buf);
 }
 
 static void numericConfigRewrite(typeData data, const char *name, struct rewriteConfigState *state) {
@@ -2040,89 +1929,90 @@ static void numericConfigRewrite(typeData data, const char *name, struct rewrite
     }
 }
 
-#define embedCommonNumericalConfig(name, alias, _flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) { \
+#define embedCommonNumericalConfig(name, alias, _flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) { \
     embedCommonConfig(name, alias, _flags) \
-    embedConfigInterface(numericConfigInit, numericConfigSet, numericConfigGet, numericConfigRewrite, apply) \
+    embedConfigInterface(numericConfigInit, numericConfigSet, numericConfigGet, numericConfigRewrite) \
     .data.numeric = { \
         .lower_bound = (lower), \
         .upper_bound = (upper), \
         .default_value = (default), \
         .is_valid_fn = (is_valid), \
+        .update_fn = (update), \
         .flags = (num_conf_flags),
 
-#define createIntConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createIntConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_INT, \
         .config.i = &(config_addr) \
     } \
 }
 
-#define createUIntConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createUIntConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_UINT, \
         .config.ui = &(config_addr) \
     } \
 }
 
-#define createLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_LONG, \
         .config.l = &(config_addr) \
     } \
 }
 
-#define createULongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createULongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_ULONG, \
         .config.ul = &(config_addr) \
     } \
 }
 
-#define createLongLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createLongLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_LONG_LONG, \
         .config.ll = &(config_addr) \
     } \
 }
 
-#define createULongLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createULongLongConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_ULONG_LONG, \
         .config.ull = &(config_addr) \
     } \
 }
 
-#define createSizeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createSizeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_SIZE_T, \
         .config.st = &(config_addr) \
     } \
 }
 
-#define createSSizeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createSSizeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_SSIZE_T, \
         .config.sst = &(config_addr) \
     } \
 }
 
-#define createTimeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createTimeTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_TIME_T, \
         .config.tt = &(config_addr) \
     } \
 }
 
-#define createOffTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
-    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, apply) \
+#define createOffTConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
+    embedCommonNumericalConfig(name, alias, flags, lower, upper, config_addr, default, num_conf_flags, is_valid, update) \
         .numeric_type = NUMERIC_TYPE_OFF_T, \
         .config.ot = &(config_addr) \
     } \
 }
 
-#define createSpecialConfig(name, alias, modifiable, setfn, getfn, rewritefn, applyfn) { \
+#define createSpecialConfig(name, alias, modifiable, setfn, getfn, rewritefn) { \
     embedCommonConfig(name, alias, modifiable) \
-    embedConfigInterface(NULL, setfn, getfn, rewritefn, applyfn) \
+    embedConfigInterface(NULL, setfn, getfn, rewritefn) \
 }
 
 static int isValidActiveDefrag(int val, const char **err) {
@@ -2157,30 +2047,6 @@ static int isValidAOFfilename(char *val, const char **err) {
     return 1;
 }
 
-static int isValidAnnouncedHostname(char *val, const char **err) {
-    if (strlen(val) >= NET_HOST_STR_LEN) {
-        *err = "Hostnames must be less than "
-            STRINGIFY(NET_HOST_STR_LEN) " characters";
-        return 0;
-    }
-
-    int i = 0;
-    char c;
-    while ((c = val[i])) {
-        /* We just validate the character set to make sure that everything
-         * is parsed and handled correctly. */
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-            || (c >= '0' && c <= '9') || (c == '-') || (c == '.')))
-        {
-            *err = "Hostnames may only contain alphanumeric characters, "
-                "hyphens or dots";
-            return 0;
-        }
-        c = val[i++];
-    }
-    return 1;
-}
-
 /* Validate specified string is a valid proc-title-template */
 static int isValidProcTitleTemplate(char *val, const char **err) {
     if (!validateProcTitleTemplate(val)) {
@@ -2190,7 +2056,9 @@ static int isValidProcTitleTemplate(char *val, const char **err) {
     return 1;
 }
 
-static int updateProcTitleTemplate(const char **err) {
+static int updateProcTitleTemplate(char *val, char *prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
     if (redisSetProcTitle(NULL) == C_ERR) {
         *err = "failed to set process title";
         return 0;
@@ -2198,18 +2066,25 @@ static int updateProcTitleTemplate(const char **err) {
     return 1;
 }
 
-static int updateHZ(const char **err) {
+static int updateHZ(long long val, long long prev, const char **err) {
+    UNUSED(prev);
     UNUSED(err);
     /* Hz is more a hint from the user, so we accept values out of range
      * but cap them to reasonable values. */
+    server.config_hz = val;
     if (server.config_hz < CONFIG_MIN_HZ) server.config_hz = CONFIG_MIN_HZ;
     if (server.config_hz > CONFIG_MAX_HZ) server.config_hz = CONFIG_MAX_HZ;
     server.hz = server.config_hz;
     return 1;
 }
 
-static int updatePort(const char **err) {
-    if (changeListenPort(server.port, &server.ipfd, acceptTcpHandler) == C_ERR) {
+static int updatePort(long long val, long long prev, const char **err) {
+    /* Do nothing if port is unchanged */
+    if (val == prev) {
+        return 1;
+    }
+
+    if (changeListenPort(val, &server.ipfd, acceptTcpHandler) == C_ERR) {
         *err = "Unable to listen on this port. Check server logs.";
         return 0;
     }
@@ -2217,23 +2092,28 @@ static int updatePort(const char **err) {
     return 1;
 }
 
-static int updateJemallocBgThread(const char **err) {
+static int updateJemallocBgThread(int val, int prev, const char **err) {
+    UNUSED(prev);
     UNUSED(err);
-    set_jemalloc_bg_thread(server.jemalloc_bg_thread);
+    set_jemalloc_bg_thread(val);
     return 1;
 }
 
-static int updateReplBacklogSize(const char **err) {
+static int updateReplBacklogSize(long long val, long long prev, const char **err) {
+    /* resizeReplicationBacklog sets server.repl_backlog_size, and relies on
+     * being able to tell when the size changes, so restore prev before calling it. */
     UNUSED(err);
-    resizeReplicationBacklog();
+    server.repl_backlog_size = prev;
+    resizeReplicationBacklog(val);
     return 1;
 }
 
-static int updateMaxmemory(const char **err) {
+static int updateMaxmemory(long long val, long long prev, const char **err) {
+    UNUSED(prev);
     UNUSED(err);
-    if (server.maxmemory) {
+    if (val) {
         size_t used = zmalloc_used_memory()-freeMemoryGetNotCountedMemory();
-        if (server.maxmemory < used) {
+        if ((unsigned long long)val < used) {
             serverLog(LL_WARNING,"WARNING: the new maxmemory value set via CONFIG SET (%llu) is smaller than the current memory usage (%zu). This will result in key eviction and/or the inability to accept new write commands depending on the maxmemory-policy.", server.maxmemory, used);
         }
         performEvictions();
@@ -2241,22 +2121,27 @@ static int updateMaxmemory(const char **err) {
     return 1;
 }
 
-static int updateGoodSlaves(const char **err) {
+static int updateGoodSlaves(long long val, long long prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
     UNUSED(err);
     refreshGoodSlavesCount();
     return 1;
 }
 
-static int updateWatchdogPeriod(const char **err) {
+static int updateWatchdogPeriod(long long val, long long prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
     UNUSED(err);
     applyWatchdogPeriod();
     return 1;
 }
 
-static int updateAppendonly(const char **err) {
-    if (!server.aof_enabled && server.aof_state != AOF_OFF) {
+static int updateAppendonly(int val, int prev, const char **err) {
+    UNUSED(prev);
+    if (val == 0 && server.aof_state != AOF_OFF) {
         stopAppendOnly();
-    } else if (server.aof_enabled && server.aof_state == AOF_OFF) {
+    } else if (val && server.aof_state == AOF_OFF) {
         if (startAppendOnly() == C_ERR) {
             *err = "Unable to turn on AOF. Check server logs.";
             return 0;
@@ -2265,85 +2150,90 @@ static int updateAppendonly(const char **err) {
     return 1;
 }
 
-static int updateSighandlerEnabled(const char **err) {
+static int updateSighandlerEnabled(int val, int prev, const char **err) {
     UNUSED(err);
-    if (server.crashlog_enabled)
+    UNUSED(prev);
+    if (val)
         setupSignalHandlers();
     else
         removeSignalHandlers();
     return 1;
 }
 
-static int updateMaxclients(const char **err) {
-    unsigned int new_maxclients = server.maxclients;
-    adjustOpenFilesLimit();
-    if (server.maxclients != new_maxclients) {
-        static char msg[128];
-        sprintf(msg, "The operating system is not able to handle the specified number of clients, try with %d", server.maxclients);
-        *err = msg;
-        return 0;
-    }
-    if ((unsigned int) aeGetSetSize(server.el) <
-        server.maxclients + CONFIG_FDSET_INCR)
-    {
-        if (aeResizeSetSize(server.el,
-            server.maxclients + CONFIG_FDSET_INCR) == AE_ERR)
-        {
-            *err = "The event loop API used by Redis is not able to handle the specified number of clients";
+static int updateMaxclients(long long val, long long prev, const char **err) {
+    /* Try to check if the OS is capable of supporting so many FDs. */
+    if (val > prev) {
+        adjustOpenFilesLimit();
+        if (server.maxclients != val) {
+            static char msg[128];
+            sprintf(msg, "The operating system is not able to handle the specified number of clients, try with %d", server.maxclients);
+            *err = msg;
+            if (server.maxclients > prev) {
+                server.maxclients = prev;
+                adjustOpenFilesLimit();
+            }
             return 0;
+        }
+        if ((unsigned int) aeGetSetSize(server.el) <
+            server.maxclients + CONFIG_FDSET_INCR)
+        {
+            if (aeResizeSetSize(server.el,
+                server.maxclients + CONFIG_FDSET_INCR) == AE_ERR)
+            {
+                *err = "The event loop API used by Redis is not able to handle the specified number of clients";
+                return 0;
+            }
         }
     }
     return 1;
 }
 
-static int updateOOMScoreAdj(const char **err) {
-    if (setOOMScoreAdj(-1) == C_ERR) {
-        *err = "Failed to set current oom_score_adj. Check server logs.";
-        return 0;
+static int updateOOMScoreAdj(int val, int prev, const char **err) {
+    UNUSED(prev);
+
+    if (val) {
+        if (setOOMScoreAdj(-1) == C_ERR) {
+            *err = "Failed to set current oom_score_adj. Check server logs.";
+            return 0;
+        }
     }
 
     return 1;
 }
 
-int updateRequirePass(const char **err) {
+
+int updateRequirePass(sds val, sds prev, const char **err) {
+    UNUSED(prev);
     UNUSED(err);
     /* The old "requirepass" directive just translates to setting
      * a password to the default user. The only thing we do
      * additionally is to remember the cleartext password in this
      * case, for backward compatibility with Redis <= 5. */
-    ACLUpdateDefaultUserPassword(server.requirepass);
+    ACLUpdateDefaultUserPassword(val);
     return 1;
 }
 
-static int applyBind(const char **err) {
-    if (changeBindAddr() == C_ERR) {
-        *err = "Failed to bind to specified addresses.";
-        return 0;
-    }
 
-    return 1;
-}
-
-int updateClusterFlags(const char **err) {
+int updateClusterFlags(int val, int prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
     UNUSED(err);
     clusterUpdateMyselfFlags();
     return 1;
 }
 
-static int updateClusterIp(const char **err) {
+int updateClusterIp(char *val, char *prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
     UNUSED(err);
     clusterUpdateMyselfIp();
     return 1;
 }
 
-int updateClusterHostname(const char **err) {
-    UNUSED(err);
-    clusterUpdateMyselfHostname();
-    return 1;
-}
-
 #ifdef USE_OPENSSL
-static int applyTlsCfg(const char **err) {
+static int updateTlsCfg(char *val, char *prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
     UNUSED(err);
 
     /* If TLS is enabled, try to configure OpenSSL. */
@@ -2354,15 +2244,31 @@ static int applyTlsCfg(const char **err) {
     }
     return 1;
 }
+static int updateTlsCfgBool(int val, int prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
+    return updateTlsCfg(NULL, NULL, err);
+}
 
-static int applyTLSPort(const char **err) {
-    /* Configure TLS in case it wasn't enabled */
-    if (!isTlsConfigured() && tlsConfigure(&server.tls_ctx_config) == C_ERR) {
+static int updateTlsCfgInt(long long val, long long prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
+    return updateTlsCfg(NULL, NULL, err);
+}
+
+static int updateTLSPort(long long val, long long prev, const char **err) {
+    /* Do nothing if port is unchanged */
+    if (val == prev) {
+        return 1;
+    }
+
+    /* Configure TLS if tls is enabled */
+    if (prev == 0 && tlsConfigure(&server.tls_ctx_config) == C_ERR) {
         *err = "Unable to update TLS configuration. Check server logs.";
         return 0;
     }
 
-    if (changeListenPort(server.tls_port, &server.tlsfd, acceptTLSHandler) == C_ERR) {
+    if (changeListenPort(val, &server.tlsfd, acceptTLSHandler) == C_ERR) {
         *err = "Unable to listen on this port. Check server logs.";
         return 0;
     }
@@ -2372,8 +2278,9 @@ static int applyTLSPort(const char **err) {
 
 #endif  /* USE_OPENSSL */
 
-static int setConfigDirOption(typeData data, sds *argv, int argc, const char **err) {
+static int setConfigDirOption(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(data);
+    UNUSED(update);
     if (argc != 1) {
         *err = "wrong number of arguments";
         return 0;
@@ -2385,17 +2292,17 @@ static int setConfigDirOption(typeData data, sds *argv, int argc, const char **e
     return 1;
 }
 
-static sds getConfigDirOption(typeData data) {
+static void getConfigDirOption(client *c, typeData data) {
     UNUSED(data);
     char buf[1024];
 
     if (getcwd(buf,sizeof(buf)) == NULL)
         buf[0] = '\0';
 
-    return sdsnew(buf);
+    addReplyBulkCString(c,buf);
 }
 
-static int setConfigSaveOption(typeData data, sds *argv, int argc, const char **err) {
+static int setConfigSaveOption(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(data);
     int j;
 
@@ -2423,7 +2330,7 @@ static int setConfigSaveOption(typeData data, sds *argv, int argc, const char **
         }
     }
     /* Finally set the new config */
-    if (!reading_config_file) {
+    if (update) {
         resetServerSaveParams();
     } else {
         /* We don't reset save params before loading, because if they're not part
@@ -2448,7 +2355,7 @@ static int setConfigSaveOption(typeData data, sds *argv, int argc, const char **
     return 1;
 }
 
-static sds getConfigSaveOption(typeData data) {
+static void getConfigSaveOption(client *c, typeData data) {
     UNUSED(data);
     sds buf = sdsempty();
     int j;
@@ -2461,15 +2368,17 @@ static sds getConfigSaveOption(typeData data) {
             buf = sdscatlen(buf," ",1);
     }
 
-    return buf;
+    addReplyBulkCString(c,buf);
+    sdsfree(buf);
 }
 
-static int setConfigClientOutputBufferLimitOption(typeData data, sds *argv, int argc, const char **err) {
+static int setConfigClientOutputBufferLimitOption(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(data);
+    UNUSED(update);
     return updateClientOutputBufferLimit(argv, argc, err);
 }
 
-static sds getConfigClientOutputBufferLimitOption(typeData data) {
+static void getConfigClientOutputBufferLimitOption(client *c, typeData data) {
     UNUSED(data);
     sds buf = sdsempty();
     int j;
@@ -2482,58 +2391,21 @@ static sds getConfigClientOutputBufferLimitOption(typeData data) {
         if (j != CLIENT_TYPE_OBUF_COUNT-1)
             buf = sdscatlen(buf," ",1);
     }
-    return buf;
+    addReplyBulkCString(c,buf);
+    sdsfree(buf);
 }
 
-/* Parse an array of CONFIG_OOM_COUNT sds strings, validate and populate
- * server.oom_score_adj_values if valid.
- */
-static int setConfigOOMScoreAdjValuesOption(typeData data, sds *argv, int argc, const char **err) {
-    int i;
-    int values[CONFIG_OOM_COUNT];
-    int change = 0;
+static int setConfigOOMScoreAdjValuesOption(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(data);
-
     if (argc != CONFIG_OOM_COUNT) {
         *err = "wrong number of arguments";
         return 0;
     }
-
-    for (i = 0; i < CONFIG_OOM_COUNT; i++) {
-        char *eptr;
-        long long val = strtoll(argv[i], &eptr, 10);
-
-        if (*eptr != '\0' || val < -2000 || val > 2000) {
-            if (err) *err = "Invalid oom-score-adj-values, elements must be between -2000 and 2000.";
-            return -1;
-        }
-
-        values[i] = val;
-    }
-
-    /* Verify that the values make sense. If they don't omit a warning but
-     * keep the configuration, which may still be valid for privileged processes.
-     */
-
-    if (values[CONFIG_OOM_REPLICA] < values[CONFIG_OOM_MASTER] ||
-        values[CONFIG_OOM_BGCHILD] < values[CONFIG_OOM_REPLICA])
-    {
-        serverLog(LL_WARNING,
-                  "The oom-score-adj-values configuration may not work for non-privileged processes! "
-                  "Please consult the documentation.");
-    }
-
-    for (i = 0; i < CONFIG_OOM_COUNT; i++) {
-        if (server.oom_score_adj_values[i] != values[i]) {
-            server.oom_score_adj_values[i] = values[i];
-            change = 1;
-        }
-    }
-
-    return change ? 1 : 2;
+    if (updateOOMScoreAdjValues(argv,err,update) == C_ERR) return 0;
+    return 1;
 }
 
-static sds getConfigOOMScoreAdjValuesOption(typeData data) {
+static void getConfigOOMScoreAdjValuesOption(client *c, typeData data) {
     UNUSED(data);
     sds buf = sdsempty();
     int j;
@@ -2544,11 +2416,13 @@ static sds getConfigOOMScoreAdjValuesOption(typeData data) {
             buf = sdscatlen(buf," ",1);
     }
 
-    return buf;
+    addReplyBulkCString(c,buf);
+    sdsfree(buf);
 }
 
-static int setConfigNotifyKeyspaceEventsOption(typeData data, sds *argv, int argc, const char **err) {
+static int setConfigNotifyKeyspaceEventsOption(typeData data, sds *argv, int argc, int update, const char **err) {
     UNUSED(data);
+    UNUSED(update);
     if (argc != 1) {
         *err = "wrong number of arguments";
         return 0;
@@ -2562,36 +2436,46 @@ static int setConfigNotifyKeyspaceEventsOption(typeData data, sds *argv, int arg
     return 1;
 }
 
-static sds getConfigNotifyKeyspaceEventsOption(typeData data) {
+static void getConfigNotifyKeyspaceEventsOption(client *c, typeData data) {
     UNUSED(data);
-    return keyspaceEventsFlagsToString(server.notify_keyspace_events);
+    sds flags = keyspaceEventsFlagsToString(server.notify_keyspace_events);
+    addReplyBulkSds(c,flags);
 }
 
-static int setConfigBindOption(typeData data, sds* argv, int argc, const char **err) {
+static int setConfigBindOption(typeData data, sds* argv, int argc, int update, const char **err) {
     UNUSED(data);
-    int j;
 
     if (argc > CONFIG_BINDADDR_MAX) {
         *err = "Too many bind addresses specified.";
         return 0;
     }
 
-    /* A single empty argument is treated as a zero bindaddr count */
-    if (argc == 1 && sdslen(argv[0]) == 0) argc = 0;
+    if (update) {
+        if (changeBindAddr(argv, argc) == C_ERR) {
+            *err = "Failed to bind to specified addresses.";
+            return 0;
+        }
+    } else {
+        int j;
 
-    /* Free old bind addresses */
-    for (j = 0; j < server.bindaddr_count; j++) {
-        zfree(server.bindaddr[j]);
+        /* A single empty argument is treated as a zero bindaddr count */
+        if (argc == 1 && sdslen(argv[0]) == 0) argc = 0;
+
+        /* Free old bind addresses */
+        for (j = 0; j < server.bindaddr_count; j++) {
+            zfree(server.bindaddr[j]);
+        }
+        for (j = 0; j < argc; j++)
+            server.bindaddr[j] = zstrdup(argv[j]);
+        server.bindaddr_count = argc;
     }
-    for (j = 0; j < argc; j++)
-        server.bindaddr[j] = zstrdup(argv[j]);
-    server.bindaddr_count = argc;
 
     return 1;
 }
 
-static int setConfigReplicaOfOption(typeData data, sds* argv, int argc, const char **err) {
+static int setConfigReplicaOfOption(typeData data, sds* argv, int argc, int update, const char **err) {
     UNUSED(data);
+    UNUSED(update);
 
     if (argc != 2) {
         *err = "wrong number of arguments";
@@ -2614,12 +2498,14 @@ static int setConfigReplicaOfOption(typeData data, sds* argv, int argc, const ch
     return 1;
 }
 
-static sds getConfigBindOption(typeData data) {
+static void getConfigBindOption(client *c, typeData data) {
     UNUSED(data);
-    return sdsjoin(server.bindaddr,server.bindaddr_count," ");
+    sds aux = sdsjoin(server.bindaddr,server.bindaddr_count," ");
+    addReplyBulkCString(c,aux);
+    sdsfree(aux);
 }
 
-static sds getConfigReplicaOfOption(typeData data) {
+static void getConfigReplicaOfOption(client *c, typeData data) {
     UNUSED(data);
     char buf[256];
     if (server.masterhost)
@@ -2627,12 +2513,7 @@ static sds getConfigReplicaOfOption(typeData data) {
                  server.masterhost, server.masterport);
     else
         buf[0] = '\0';
-    return sdsnew(buf);
-}
-
-int allowProtectedAction(int config, client *c) {
-    return (config == PROTECTED_ACTION_ALLOWED_YES) ||
-           (config == PROTECTED_ACTION_ALLOWED_LOCAL && islocalClient(c));
+    addReplyBulkCString(c,buf);
 }
 
 standardConfig configs[] = {
@@ -2640,6 +2521,7 @@ standardConfig configs[] = {
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
     createBoolConfig("daemonize", NULL, IMMUTABLE_CONFIG, server.daemonize, 0, NULL, NULL),
     createBoolConfig("io-threads-do-reads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, server.io_threads_do_reads, 0,NULL, NULL), /* Read + parse from threads? */
+    createBoolConfig("lua-replicate-commands", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.lua_always_replicate_commands, 1, NULL, NULL),
     createBoolConfig("always-show-logo", NULL, IMMUTABLE_CONFIG, server.always_show_logo, 0, NULL, NULL),
     createBoolConfig("protected-mode", NULL, MODIFIABLE_CONFIG, server.protected_mode, 1, NULL, NULL),
     createBoolConfig("rdbcompression", NULL, MODIFIABLE_CONFIG, server.rdb_compression, 1, NULL, NULL),
@@ -2671,12 +2553,11 @@ standardConfig configs[] = {
     createBoolConfig("activedefrag", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.active_defrag_enabled, 0, isValidActiveDefrag, NULL),
     createBoolConfig("syslog-enabled", NULL, IMMUTABLE_CONFIG, server.syslog_enabled, 0, NULL, NULL),
     createBoolConfig("cluster-enabled", NULL, IMMUTABLE_CONFIG, server.cluster_enabled, 0, NULL, NULL),
-    createBoolConfig("appendonly", NULL, MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, server.aof_enabled, 0, NULL, updateAppendonly),
+    createBoolConfig("appendonly", NULL, MODIFIABLE_CONFIG, server.aof_enabled, 0, NULL, updateAppendonly),
     createBoolConfig("cluster-allow-reads-when-down", NULL, MODIFIABLE_CONFIG, server.cluster_allow_reads_when_down, 0, NULL, NULL),
-    createBoolConfig("cluster-allow-pubsubshard-when-down", NULL, MODIFIABLE_CONFIG, server.cluster_allow_pubsubshard_when_down, 1, NULL, NULL),
     createBoolConfig("crash-log-enabled", NULL, MODIFIABLE_CONFIG, server.crashlog_enabled, 1, NULL, updateSighandlerEnabled),
     createBoolConfig("crash-memcheck-enabled", NULL, MODIFIABLE_CONFIG, server.memcheck_enabled, 1, NULL, NULL),
-    createBoolConfig("use-exit-on-panic", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.use_exit_on_panic, 0, NULL, NULL),
+    createBoolConfig("use-exit-on-panic", NULL, MODIFIABLE_CONFIG, server.use_exit_on_panic, 0, NULL, NULL),
     createBoolConfig("disable-thp", NULL, MODIFIABLE_CONFIG, server.disable_thp, 1, NULL, NULL),
     createBoolConfig("cluster-allow-replica-migration", NULL, MODIFIABLE_CONFIG, server.cluster_allow_replica_migration, 1, NULL, NULL),
     createBoolConfig("replica-announced", NULL, MODIFIABLE_CONFIG, server.replica_announced, 1, NULL, NULL),
@@ -2689,9 +2570,8 @@ standardConfig configs[] = {
     createStringConfig("masteruser", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masteruser, NULL, NULL, NULL),
     createStringConfig("cluster-announce-ip", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.cluster_announce_ip, NULL, NULL, updateClusterIp),
     createStringConfig("cluster-config-file", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.cluster_configfile, "nodes.conf", NULL, NULL),
-    createStringConfig("cluster-announce-hostname", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.cluster_announce_hostname, NULL, isValidAnnouncedHostname, updateClusterHostname),
     createStringConfig("syslog-ident", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.syslog_ident, "redis", NULL, NULL),
-    createStringConfig("dbfilename", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG, ALLOW_EMPTY_STRING, server.rdb_filename, "dump.rdb", isValidDBfilename, NULL),
+    createStringConfig("dbfilename", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.rdb_filename, "dump.rdb", isValidDBfilename, NULL),
     createStringConfig("appendfilename", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.aof_filename, "appendonly.aof", isValidAOFfilename, NULL),
     createStringConfig("server_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.server_cpulist, NULL, NULL, NULL),
     createStringConfig("bio_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bio_cpulist, NULL, NULL, NULL),
@@ -2709,17 +2589,13 @@ standardConfig configs[] = {
     /* Enum Configs */
     createEnumConfig("supervised", NULL, IMMUTABLE_CONFIG, supervised_mode_enum, server.supervised_mode, SUPERVISED_NONE, NULL, NULL),
     createEnumConfig("syslog-facility", NULL, IMMUTABLE_CONFIG, syslog_facility_enum, server.syslog_facility, LOG_LOCAL0, NULL, NULL),
-    createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
+    createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, NULL),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, USER_FLAG_ALLCHANNELS, NULL, NULL),
     createEnumConfig("sanitize-dump-payload", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, sanitize_dump_payload_enum, server.sanitize_dump_payload, SANITIZE_DUMP_NO, NULL, NULL),
-    createEnumConfig("enable-protected-configs", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_protected_configs, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),
-    createEnumConfig("enable-debug-command", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_debug_cmd, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),
-    createEnumConfig("enable-module-command", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_module_cmd, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),
-    createEnumConfig("cluster-preferred-endpoint-type", NULL, MODIFIABLE_CONFIG, cluster_preferred_endpoint_type_enum, server.cluster_preferred_endpoint_type, CLUSTER_ENDPOINT_TYPE_IP, NULL, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
@@ -2750,14 +2626,13 @@ standardConfig configs[] = {
     createIntConfig("repl-timeout", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.repl_timeout, 60, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("repl-ping-replica-period", "repl-ping-slave-period", MODIFIABLE_CONFIG, 1, INT_MAX, server.repl_ping_slave_period, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("list-compress-depth", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 0, INT_MAX, server.list_compress_depth, 0, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("rdb-key-save-delay", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, INT_MIN, INT_MAX, server.rdb_key_save_delay, 0, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("key-load-delay", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, INT_MIN, INT_MAX, server.key_load_delay, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("rdb-key-save-delay", NULL, MODIFIABLE_CONFIG, INT_MIN, INT_MAX, server.rdb_key_save_delay, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("key-load-delay", NULL, MODIFIABLE_CONFIG, INT_MIN, INT_MAX, server.key_load_delay, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("active-expire-effort", NULL, MODIFIABLE_CONFIG, 1, 10, server.active_expire_effort, 1, INTEGER_CONFIG, NULL, NULL), /* From 1 to 10. */
     createIntConfig("hz", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.config_hz, CONFIG_DEFAULT_HZ, INTEGER_CONFIG, NULL, updateHZ),
     createIntConfig("min-replicas-to-write", "min-slaves-to-write", MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_min_slaves_to_write, 0, INTEGER_CONFIG, NULL, updateGoodSlaves),
     createIntConfig("min-replicas-max-lag", "min-slaves-max-lag", MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_min_slaves_max_lag, 10, INTEGER_CONFIG, NULL, updateGoodSlaves),
-    createIntConfig("watchdog-period", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.watchdog_period, 0, INTEGER_CONFIG, NULL, updateWatchdogPeriod),
-    createIntConfig("shutdown-timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.shutdown_timeout, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("watchdog-period", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.watchdog_period, 0, INTEGER_CONFIG, NULL, updateWatchdogPeriod),
 
     /* Unsigned int configs */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),
@@ -2769,7 +2644,7 @@ standardConfig configs[] = {
     createULongConfig("acllog-max-len", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.acllog_max_len, 128, INTEGER_CONFIG, NULL, NULL),
 
     /* Long Long configs */
-    createLongLongConfig("script-time-limit", "lua-time-limit", MODIFIABLE_CONFIG, 0, LONG_MAX, server.script_time_limit, 5000, INTEGER_CONFIG, NULL, NULL),/* milliseconds */
+    createLongLongConfig("lua-time-limit", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.lua_time_limit, 5000, INTEGER_CONFIG, NULL, NULL),/* milliseconds */
     createLongLongConfig("cluster-node-timeout", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.cluster_node_timeout, 15000, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("slowlog-log-slower-than", NULL, MODIFIABLE_CONFIG, -1, LLONG_MAX, server.slowlog_log_slower_than, 10000, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("latency-monitor-threshold", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.latency_monitor_threshold, 0, INTEGER_CONFIG, NULL, NULL),
@@ -2779,7 +2654,6 @@ standardConfig configs[] = {
 
     /* Unsigned Long Long configs */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
-    createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_sendbuf_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
 
     /* Size_t configs */
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
@@ -2797,39 +2671,39 @@ standardConfig configs[] = {
     /* Other configs */
     createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60*60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 hour */
     createOffTConfig("auto-aof-rewrite-min-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.aof_rewrite_min_size, 64*1024*1024, MEMORY_CONFIG, NULL, NULL),
-    createOffTConfig("loading-process-events-interval-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1024, INT_MAX, server.loading_process_events_interval_bytes, 1024*1024*2, INTEGER_CONFIG, NULL, NULL),
+    createOffTConfig("loading-process-events-interval-bytes", NULL, MODIFIABLE_CONFIG, 1024, INT_MAX, server.loading_process_events_interval_bytes, 1024*1024*2, INTEGER_CONFIG, NULL, NULL),
 
 #ifdef USE_OPENSSL
-    createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */
-    createIntConfig("tls-session-cache-size", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.session_cache_size, 20*1024, INTEGER_CONFIG, NULL, applyTlsCfg),
-    createIntConfig("tls-session-cache-timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.session_cache_timeout, 300, INTEGER_CONFIG, NULL, applyTlsCfg),
-    createBoolConfig("tls-cluster", NULL, MODIFIABLE_CONFIG, server.tls_cluster, 0, NULL, applyTlsCfg),
-    createBoolConfig("tls-replication", NULL, MODIFIABLE_CONFIG, server.tls_replication, 0, NULL, applyTlsCfg),
+    createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, updateTLSPort), /* TCP port. */
+    createIntConfig("tls-session-cache-size", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.session_cache_size, 20*1024, INTEGER_CONFIG, NULL, updateTlsCfgInt),
+    createIntConfig("tls-session-cache-timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.session_cache_timeout, 300, INTEGER_CONFIG, NULL, updateTlsCfgInt),
+    createBoolConfig("tls-cluster", NULL, MODIFIABLE_CONFIG, server.tls_cluster, 0, NULL, updateTlsCfgBool),
+    createBoolConfig("tls-replication", NULL, MODIFIABLE_CONFIG, server.tls_replication, 0, NULL, updateTlsCfgBool),
     createEnumConfig("tls-auth-clients", NULL, MODIFIABLE_CONFIG, tls_auth_clients_enum, server.tls_auth_clients, TLS_CLIENT_AUTH_YES, NULL, NULL),
-    createBoolConfig("tls-prefer-server-ciphers", NULL, MODIFIABLE_CONFIG, server.tls_ctx_config.prefer_server_ciphers, 0, NULL, applyTlsCfg),
-    createBoolConfig("tls-session-caching", NULL, MODIFIABLE_CONFIG, server.tls_ctx_config.session_caching, 1, NULL, applyTlsCfg),
-    createStringConfig("tls-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.cert_file, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.key_file, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-key-file-pass", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.key_file_pass, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-client-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_cert_file, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-client-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_key_file, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-client-key-file-pass", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_key_file_pass, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-dh-params-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.dh_params_file, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-ca-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_file, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-ca-cert-dir", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_dir, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-protocols", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.protocols, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, applyTlsCfg),
-    createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, applyTlsCfg),
+    createBoolConfig("tls-prefer-server-ciphers", NULL, MODIFIABLE_CONFIG, server.tls_ctx_config.prefer_server_ciphers, 0, NULL, updateTlsCfgBool),
+    createBoolConfig("tls-session-caching", NULL, MODIFIABLE_CONFIG, server.tls_ctx_config.session_caching, 1, NULL, updateTlsCfgBool),
+    createStringConfig("tls-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.cert_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.key_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-key-file-pass", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.key_file_pass, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-client-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_cert_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-client-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_key_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-client-key-file-pass", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_key_file_pass, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-dh-params-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.dh_params_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-ca-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-ca-cert-dir", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_dir, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-protocols", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.protocols, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
 #endif
 
     /* Special configs */
-    createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),
-    createSpecialConfig("save", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigSaveOption, getConfigSaveOption, rewriteConfigSaveOption, NULL),
-    createSpecialConfig("client-output-buffer-limit", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigClientOutputBufferLimitOption, getConfigClientOutputBufferLimitOption, rewriteConfigClientOutputBufferLimitOption, NULL),
-    createSpecialConfig("oom-score-adj-values", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigOOMScoreAdjValuesOption, getConfigOOMScoreAdjValuesOption, rewriteConfigOOMScoreAdjValuesOption, updateOOMScoreAdj),
-    createSpecialConfig("notify-keyspace-events", NULL, MODIFIABLE_CONFIG, setConfigNotifyKeyspaceEventsOption, getConfigNotifyKeyspaceEventsOption, rewriteConfigNotifyKeyspaceEventsOption, NULL),
-    createSpecialConfig("bind", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigBindOption, getConfigBindOption, rewriteConfigBindOption, applyBind),
-    createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
+    createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption),
+    createSpecialConfig("save", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigSaveOption, getConfigSaveOption, rewriteConfigSaveOption),
+    createSpecialConfig("client-output-buffer-limit", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigClientOutputBufferLimitOption, getConfigClientOutputBufferLimitOption, rewriteConfigClientOutputBufferLimitOption),
+    createSpecialConfig("oom-score-adj-values", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigOOMScoreAdjValuesOption, getConfigOOMScoreAdjValuesOption, rewriteConfigOOMScoreAdjValuesOption),
+    createSpecialConfig("notify-keyspace-events", NULL, MODIFIABLE_CONFIG, setConfigNotifyKeyspaceEventsOption, getConfigNotifyKeyspaceEventsOption, rewriteConfigNotifyKeyspaceEventsOption),
+    createSpecialConfig("bind", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigBindOption, getConfigBindOption, rewriteConfigBindOption),
+    createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption),
 
     /* NULL Terminator */
     {NULL}

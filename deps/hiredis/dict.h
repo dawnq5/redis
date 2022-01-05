@@ -60,8 +60,8 @@ typedef struct dictType {
 typedef struct dict {
     dictEntry **table;
     dictType *type;
-    unsigned long size;
-    unsigned long sizemask;
+    unsigned long size;//2^n  size 当等于2^n, 任意数 % 2^n = 任意数 & (2^n - 1)，使用&符号的效率比%高，%需要迭代作除法取余数 _dictNextPower
+    unsigned long sizemask;//size-1  k%size => k&(sizemask)
     unsigned long used;
     void *privdata;
 } dict;

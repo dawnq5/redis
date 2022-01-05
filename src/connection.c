@@ -91,6 +91,7 @@ connection *connCreateSocket() {
  * Callers should use connGetState() and verify the created connection
  * is not in an error state (which is not possible for a socket connection,
  * but could but possible with other protocols).
+ * 包装一个connection对象
  */
 connection *connCreateAcceptedSocket(int fd) {
     connection *conn = connCreateSocket();

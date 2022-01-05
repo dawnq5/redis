@@ -1,3 +1,4 @@
+#define REDISMODULE_EXPERIMENTAL_API
 #include "redismodule.h"
 
 // A simple global user

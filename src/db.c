@@ -31,8 +31,6 @@
 #include "cluster.h"
 #include "atomicvar.h"
 #include "latency.h"
-#include "script.h"
-#include "functions.h"
 
 #include <signal.h>
 #include <ctype.h>
@@ -41,7 +39,6 @@
  * C-level DB API
  *----------------------------------------------------------------------------*/
 
-int expireIfNeeded(redisDb *db, robj *key, int force_delete_expired);
 int keyIsExpired(redisDb *db, robj *key);
 
 /* Update LFU when an object is accessed.
@@ -53,53 +50,14 @@ void updateLFU(robj *val) {
     val->lru = (LFUGetTimeInMinutes()<<8) | counter;
 }
 
-/* Lookup a key for read or write operations, or return NULL if the key is not
- * found in the specified DB. This function implements the functionality of
- * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
- *
- * Side-effects of calling this function:
- *
- * 1. A key gets expired if it reached it's TTL.
- * 2. The key's last access time is updated.
- * 3. The global keys hits/misses stats are updated (reported in INFO).
- * 4. If keyspace notifications are enabled, a "keymiss" notification is fired.
- *
- * Flags change the behavior of this command:
- *
- *  LOOKUP_NONE (or zero): No special flags are passed.
- *  LOOKUP_NOTOUCH: Don't alter the last access time of the key.
- *  LOOKUP_NONOTIFY: Don't trigger keyspace event on key miss.
- *  LOOKUP_NOSTATS: Don't increment key hits/misses couters.
- *  LOOKUP_WRITE: Prepare the key for writing (delete expired keys even on
- *                replicas, use separate keyspace stats and events (TODO)).
- *
- * Note: this function also returns NULL if the key is logically expired but
- * still existing, in case this is a replica and the LOOKUP_WRITE is not set.
- * Even if the key expiry is master-driven, we can correctly report a key is
- * expired on replicas even if the master is lagging expiring our key via DELs
- * in the replication link. */
+/* Low level key lookup API, not actually called directly from commands
+ * implementations that should instead rely on lookupKeyRead(),
+ * lookupKeyWrite() and lookupKeyReadWithFlags(). */
 robj *lookupKey(redisDb *db, robj *key, int flags) {
     dictEntry *de = dictFind(db->dict,key->ptr);
-    robj *val = NULL;
     if (de) {
-        val = dictGetVal(de);
-        int force_delete_expired = flags & LOOKUP_WRITE;
-        if (force_delete_expired) {
-            /* Forcing deletion of expired keys on a replica makes the replica
-             * inconsistent with the master. The reason it's allowed for write
-             * commands is to make writable replicas behave consistently. It
-             * shall not be used in readonly commands. Modules are accepted so
-             * that we don't break old modules. */
-            client *c = server.in_script ? scriptGetClient() : server.current_client;
-            serverAssert(!c || !c->cmd || (c->cmd->flags & (CMD_WRITE|CMD_MODULE)));
-        }
-        if (expireIfNeeded(db, key, force_delete_expired)) {
-            /* The key is no longer valid. */
-            val = NULL;
-        }
-    }
+        robj *val = dictGetVal(de);
 
-    if (val) {
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
@@ -110,33 +68,75 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
                 val->lru = LRU_CLOCK();
             }
         }
-
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
-            server.stat_keyspace_hits++;
-        /* TODO: Use separate hits stats for WRITE */
+        return val;
     } else {
-        if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
-            notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
-            server.stat_keyspace_misses++;
-        /* TODO: Use separate misses stats and notify event for WRITE */
+        return NULL;
     }
-
-    return val;
 }
 
 /* Lookup a key for read operations, or return NULL if the key is not found
  * in the specified DB.
  *
+ * As a side effect of calling this function:
+ * 1. A key gets expired if it reached it's TTL.
+ * 2. The key last access time is updated.
+ * 3. The global keys hits/misses stats are updated (reported in INFO).
+ * 4. If keyspace notifications are enabled, a "keymiss" notification is fired.
+ *
  * This API should not be used when we write to the key after obtaining
  * the object linked to the key, but only for read only operations.
  *
- * This function is equivalent to lookupKey(). The point of using this function
- * rather than lookupKey() directly is to indicate that the purpose is to read
- * the key. */
+ * Flags change the behavior of this command:
+ *
+ *  LOOKUP_NONE (or zero): no special flags are passed.
+ *  LOOKUP_NOTOUCH: don't alter the last access time of the key.
+ *
+ * Note: this function also returns NULL if the key is logically expired
+ * but still existing, in case this is a slave, since this API is called only
+ * for read operations. Even if the key expiry is master-driven, we can
+ * correctly report a key is expired on slaves even if the master is lagging
+ * expiring our key via DELs in the replication link. */
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
-    serverAssert(!(flags & LOOKUP_WRITE));
-    return lookupKey(db, key, flags);
+    robj *val;
+
+    if (expireIfNeeded(db,key) == 1) {
+        /* If we are in the context of a master, expireIfNeeded() returns 1
+         * when the key is no longer valid, so we can return NULL ASAP. */
+        if (server.masterhost == NULL)
+            goto keymiss;
+
+        /* However if we are in the context of a slave, expireIfNeeded() will
+         * not really try to expire the key, it only returns information
+         * about the "logical" status of the key: key expiring is up to the
+         * master in order to have a consistent view of master's data set.
+         *
+         * However, if the command caller is not the master, and as additional
+         * safety measure, the command invoked is a read-only command, we can
+         * safely return NULL here, and provide a more consistent behavior
+         * to clients accessing expired values in a read-only fashion, that
+         * will say the key as non existing.
+         *
+         * Notably this covers GETs when slaves are used to scale reads. */
+        if (server.current_client &&
+            server.current_client != server.master &&
+            server.current_client->cmd &&
+            server.current_client->cmd->flags & CMD_READONLY)
+        {
+            goto keymiss;
+        }
+    }
+    val = lookupKey(db,key,flags);
+    if (val == NULL)
+        goto keymiss;
+    server.stat_keyspace_hits++;
+    return val;
+
+keymiss:
+    if (!(flags & LOOKUP_NONOTIFY)) {
+        notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
+    }
+    server.stat_keyspace_misses++;
+    return NULL;
 }
 
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
@@ -146,13 +146,13 @@ robj *lookupKeyRead(redisDb *db, robj *key) {
 }
 
 /* Lookup a key for write operations, and as a side effect, if needed, expires
- * the key if its TTL is reached. It's equivalent to lookupKey() with the
- * LOOKUP_WRITE flag added.
+ * the key if its TTL is reached.
  *
  * Returns the linked value object if the key exists or NULL if the key
  * does not exist in the specified DB. */
 robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
-    return lookupKey(db, key, flags | LOOKUP_WRITE);
+    expireIfNeeded(db,key);
+    return lookupKey(db,key,flags);
 }
 
 robj *lookupKeyWrite(redisDb *db, robj *key) {
@@ -292,7 +292,7 @@ robj *dbRandomKey(redisDb *db) {
                  * return a key name that may be already expired. */
                 return keyobj;
             }
-            if (expireIfNeeded(db,keyobj,0)) {
+            if (expireIfNeeded(db,keyobj)) {
                 decrRefCount(keyobj);
                 continue; /* search for another key. This expired. */
             }
@@ -413,24 +413,22 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
     return removed;
 }
 
-/* Remove all data (keys and functions) from all the databases in a
- * Redis server. If callback is given the function is called from
- * time to time to signal that work is in progress.
+/* Remove all keys from all the databases in a Redis server.
+ * If callback is given the function is called from time to time to
+ * signal that work is in progress.
  *
  * The dbnum can be -1 if all the DBs should be flushed, or the specified
  * DB number if we want to flush only a single Redis database number.
  *
  * Flags are be EMPTYDB_NO_FLAGS if no special flags are specified or
  * EMPTYDB_ASYNC if we want the memory to be freed in a different thread
- * and the function to return ASAP. EMPTYDB_NOFUNCTIONS can also be set
- * to specify that we do not want to delete the functions.
+ * and the function to return ASAP.
  *
  * On success the function returns the number of keys removed from the
  * database(s). Otherwise -1 is returned in the specific case the
  * DB number is out of range, and errno is set to EINVAL. */
-long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
+long long emptyDb(int dbnum, int flags, void(callback)(dict*)) {
     int async = (flags & EMPTYDB_ASYNC);
-    int with_functions = !(flags & EMPTYDB_NOFUNCTIONS);
     RedisModuleFlushInfoV1 fi = {REDISMODULE_FLUSHINFO_VERSION,!async,dbnum};
     long long removed = 0;
 
@@ -458,11 +456,6 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
     if (server.cluster_enabled) slotToKeyFlush(server.db);
 
     if (dbnum == -1) flushSlaveKeysWithExpireList();
-
-    if (with_functions) {
-        serverAssert(dbnum == -1);
-        functionsCtxClearCurrent(async);
-    }
 
     /* Also fire the end event. Note that this event will fire almost
      * immediately after the start event if the flush is asynchronous. */
@@ -591,7 +584,7 @@ int getFlushCommandFlags(client *c, int *flags) {
 
 /* Flushes the whole server data set. */
 void flushAllDataAndResetRDB(int flags) {
-    server.dirty += emptyData(-1,flags,NULL);
+    server.dirty += emptyDb(-1,flags,NULL);
     if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
     if (server.saveparamslen > 0) {
         /* Normally rdbSave() will reset dirty, but we don't want this here
@@ -599,7 +592,7 @@ void flushAllDataAndResetRDB(int flags) {
         int saved_dirty = server.dirty;
         rdbSaveInfo rsi, *rsiptr;
         rsiptr = rdbPopulateSaveInfo(&rsi);
-        rdbSave(SLAVE_REQ_NONE,server.rdb_filename,rsiptr);
+        rdbSave(server.rdb_filename,rsiptr);
         server.dirty = saved_dirty;
     }
 
@@ -622,8 +615,7 @@ void flushdbCommand(client *c) {
     int flags;
 
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
-    /* flushdb should not flush the functions */
-    server.dirty += emptyData(c->db->id,flags | EMPTYDB_NOFUNCTIONS,NULL);
+    server.dirty += emptyDb(c->db->id,flags,NULL);
     addReply(c,shared.ok);
 #if defined(USE_JEMALLOC)
     /* jemalloc 5 doesn't release pages back to the OS when there's no traffic.
@@ -640,8 +632,7 @@ void flushdbCommand(client *c) {
 void flushallCommand(client *c) {
     int flags;
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
-    /* flushall should not flush the functions */
-    flushAllDataAndResetRDB(flags | EMPTYDB_NOFUNCTIONS);
+    flushAllDataAndResetRDB(flags);
     addReply(c,shared.ok);
 }
 
@@ -650,7 +641,7 @@ void delGenericCommand(client *c, int lazy) {
     int numdel = 0, j;
 
     for (j = 1; j < c->argc; j++) {
-        expireIfNeeded(c->db,c->argv[j],0);
+        expireIfNeeded(c->db,c->argv[j]);
         int deleted  = lazy ? dbAsyncDelete(c->db,c->argv[j]) :
                               dbSyncDelete(c->db,c->argv[j]);
         if (deleted) {
@@ -948,7 +939,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
         }
 
         /* Filter element if it is an expired key. */
-        if (!filter && o == NULL && expireIfNeeded(c->db, kobj, 0)) filter = 1;
+        if (!filter && o == NULL && expireIfNeeded(c->db, kobj)) filter = 1;
 
         /* Remove the element and its associated value if needed. */
         if (filter) {
@@ -1033,59 +1024,23 @@ void typeCommand(client *c) {
 }
 
 void shutdownCommand(client *c) {
-    int flags = SHUTDOWN_NOFLAGS;
-    int abort = 0;
-    for (int i = 1; i < c->argc; i++) {
-        if (!strcasecmp(c->argv[i]->ptr,"nosave")) {
+    int flags = 0;
+
+    if (c->argc > 2) {
+        addReplyErrorObject(c,shared.syntaxerr);
+        return;
+    } else if (c->argc == 2) {
+        if (!strcasecmp(c->argv[1]->ptr,"nosave")) {
             flags |= SHUTDOWN_NOSAVE;
-        } else if (!strcasecmp(c->argv[i]->ptr,"save")) {
+        } else if (!strcasecmp(c->argv[1]->ptr,"save")) {
             flags |= SHUTDOWN_SAVE;
-        } else if (!strcasecmp(c->argv[i]->ptr, "now")) {
-            flags |= SHUTDOWN_NOW;
-        } else if (!strcasecmp(c->argv[i]->ptr, "force")) {
-            flags |= SHUTDOWN_FORCE;
-        } else if (!strcasecmp(c->argv[i]->ptr, "abort")) {
-            abort = 1;
         } else {
             addReplyErrorObject(c,shared.syntaxerr);
             return;
         }
     }
-    if ((abort && flags != SHUTDOWN_NOFLAGS) ||
-        (flags & SHUTDOWN_NOSAVE && flags & SHUTDOWN_SAVE))
-    {
-        /* Illegal combo. */
-        addReplyErrorObject(c,shared.syntaxerr);
-        return;
-    }
-
-    if (abort) {
-        if (abortShutdown() == C_OK)
-            addReply(c, shared.ok);
-        else
-            addReplyError(c, "No shutdown in progress.");
-        return;
-    }
-
-    if (!(flags & SHUTDOWN_NOW) && c->flags & CLIENT_DENY_BLOCKING) {
-        addReplyError(c, "SHUTDOWN without NOW or ABORT isn't allowed for DENY BLOCKING client");
-        return;
-    }
-
-    if (!(flags & SHUTDOWN_NOSAVE) && scriptIsTimedout()) {
-        /* Script timed out. Shutdown allowed only with the NOSAVE flag. See
-         * also processCommand where these errors are returned. */
-        if (scriptIsEval())
-            addReplyErrorObject(c, shared.slowevalerr);
-        else
-            addReplyErrorObject(c, shared.slowscripterr);
-        return;
-    }
-
-    blockClient(c, BLOCKED_SHUTDOWN);
     if (prepareForShutdown(flags) == C_OK) exit(0);
-    /* If we're here, then shutdown is ongoing (the client is still blocked) or
-     * failed (the client has received an error). */
+    addReplyError(c,"Errors trying to SHUTDOWN. Check logs.");
 }
 
 void renameGenericCommand(client *c, int nx) {
@@ -1251,7 +1206,7 @@ void copyCommand(client *c) {
     }
 
     /* Check if the element exists and get a reference */
-    o = lookupKeyRead(c->db, key);
+    o = lookupKeyWrite(c->db, key);
     if (!o) {
         addReply(c,shared.czero);
         return;
@@ -1311,11 +1266,8 @@ void scanDatabaseForReadyLists(redisDb *db) {
     dictIterator *di = dictGetSafeIterator(db->blocking_keys);
     while((de = dictNext(di)) != NULL) {
         robj *key = dictGetKey(de);
-        dictEntry *kde = dictFind(db->dict,key->ptr);
-        if (kde) {
-            robj *value = dictGetVal(kde);
-            signalKeyAsReady(db, key, value->type);
-        }
+        robj *value = lookupKey(db,key,LOOKUP_NOTOUCH);
+        if (value) signalKeyAsReady(db, key, value->type);
     }
     dictReleaseIterator(di);
 }
@@ -1502,7 +1454,7 @@ void deleteExpiredKeyAndPropagate(redisDb *db, robj *keyobj) {
     latencyAddSampleIfNeeded("expire-del",expire_latency);
     notifyKeyspaceEvent(NOTIFY_EXPIRED,"expired",keyobj,db->id);
     signalModifiedKey(NULL, db, keyobj);
-    propagateDeletion(db,keyobj,server.lazyfree_lazy_expire);
+    propagateExpire(db,keyobj,server.lazyfree_lazy_expire);
     server.stat_expiredkeys++;
 }
 
@@ -1513,18 +1465,8 @@ void deleteExpiredKeyAndPropagate(redisDb *db, robj *keyobj) {
  * This way the key expiry is centralized in one place, and since both
  * AOF and the master->slave link guarantee operation ordering, everything
  * will be consistent even if we allow write operations against expiring
- * keys.
- *
- * This function may be called from:
- * 1. Within call(): Example: Lazy-expire on key access.
- *    In this case the caller doesn't have to do anything
- *    because call() handles server.also_propagate(); or
- * 2. Outside of call(): Example: Active-expire, eviction.
- *    In this the caller must remember to call
- *    propagatePendingCommands, preferably at the end of
- *    the deletion batch, so that DELs will be wrapped
- *    in MULTI/EXEC */
-void propagateDeletion(redisDb *db, robj *key, int lazy) {
+ * keys. */
+void propagateExpire(redisDb *db, robj *key, int lazy) {
     robj *argv[2];
 
     argv[0] = lazy ? shared.unlink : shared.del;
@@ -1536,7 +1478,7 @@ void propagateDeletion(redisDb *db, robj *key, int lazy) {
      * Even if module executed a command without asking for propagation. */
     int prev_replication_allowed = server.replication_allowed;
     server.replication_allowed = 1;
-    alsoPropagate(db->id,argv,2,PROPAGATE_AOF|PROPAGATE_REPL);
+    propagate(db->id,argv,2,PROPAGATE_AOF|PROPAGATE_REPL);
     server.replication_allowed = prev_replication_allowed;
 
     decrRefCount(argv[0]);
@@ -1558,8 +1500,8 @@ int keyIsExpired(redisDb *db, robj *key) {
      * only the first time it is accessed and not in the middle of the
      * script execution, making propagation to slaves / AOF consistent.
      * See issue #1525 on Github for more information. */
-    if (server.script_caller) {
-        now = evalTimeSnapshot();
+    if (server.lua_caller) {
+        now = server.lua_time_snapshot;
     }
     /* If we are in the middle of a command execution, we still want to use
      * a reference time that does not change: in that case we just use the
@@ -1587,10 +1529,10 @@ int keyIsExpired(redisDb *db, robj *key) {
  * is via lookupKey*() family of functions.
  *
  * The behavior of the function depends on the replication role of the
- * instance, because by default replicas do not delete expired keys. They
- * wait for DELs from the master for consistency matters. However even
- * replicas will try to have a coherent return value for the function,
- * so that read commands executed in the replica side will be able to
+ * instance, because slave instances do not expire keys, they wait
+ * for DELs from the master for consistency matters. However even
+ * slaves will try to have a coherent return value for the function,
+ * so that read commands executed in the slave side will be able to
  * behave like if the key is expired even if still present (because the
  * master has yet to propagate the DEL).
  *
@@ -1598,34 +1540,20 @@ int keyIsExpired(redisDb *db, robj *key) {
  * key will be evicted from the database. Also this may trigger the
  * propagation of a DEL/UNLINK command in AOF / replication stream.
  *
- * On replicas, this function does not delete expired keys by default, but
- * it still returns 1 if the key is logically expired. To force deletion
- * of logically expired keys even on replicas, set force_delete_expired to
- * a non-zero value. Note though that if the current client is executing
- * replicated commands from the master, keys are never considered expired.
- *
  * The return value of the function is 0 if the key is still valid,
  * otherwise the function returns 1 if the key is expired. */
-int expireIfNeeded(redisDb *db, robj *key, int force_delete_expired) {
+int expireIfNeeded(redisDb *db, robj *key) {
     if (!keyIsExpired(db,key)) return 0;
 
-    /* If we are running in the context of a replica, instead of
+    /* If we are running in the context of a slave, instead of
      * evicting the expired key from the database, we return ASAP:
-     * the replica key expiration is controlled by the master that will
-     * send us synthesized DEL operations for expired keys. The
-     * exception is when write operations are performed on writable
-     * replicas.
+     * the slave key expiration is controlled by the master that will
+     * send us synthesized DEL operations for expired keys.
      *
      * Still we try to return the right information to the caller,
      * that is, 0 if we think the key should be still valid, 1 if
-     * we think the key is expired at this time.
-     *
-     * When replicating commands from the master, keys are never considered
-     * expired. */
-    if (server.masterhost != NULL) {
-        if (server.current_client == server.master) return 0;
-        if (!force_delete_expired) return 1;
-    }
+     * we think the key is expired at this time. */
+    if (server.masterhost != NULL) return 1;
 
     /* If clients are paused, we keep the current dataset constant,
      * but return to the client what we believe is the right state. Typically,
@@ -1800,11 +1728,6 @@ int evalGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *
     return genericGetKeys(0, 2, 3, 1, argv, argc, result);
 }
 
-int functionGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
-    UNUSED(cmd);
-    return genericGetKeys(0, 2, 3, 1, argv, argc, result);
-}
-
 int lmpopGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     UNUSED(cmd);
     return genericGetKeys(0, 1, 2, 1, argv, argc, result);
@@ -1936,6 +1859,31 @@ int georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysRes
     }
     result->numkeys = num;
     return num;
+}
+
+/* LCS ... [KEYS <key1> <key2>] ... */
+int lcsGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    int i;
+    int *keys = getKeysPrepareResult(result, 2);
+    UNUSED(cmd);
+
+    /* We need to parse the options of the command in order to check for the
+     * "KEYS" argument before the "STRINGS" argument. */
+    for (i = 1; i < argc; i++) {
+        char *arg = argv[i]->ptr;
+        int moreargs = (argc-1) - i;
+
+        if (!strcasecmp(arg, "strings")) {
+            break;
+        } else if (!strcasecmp(arg, "keys") && moreargs >= 2) {
+            keys[0] = i+1;
+            keys[1] = i+2;
+            result->numkeys = 2;
+            return result->numkeys;
+        }
+    }
+    result->numkeys = 0;
+    return result->numkeys;
 }
 
 /* XREAD [BLOCK <milliseconds>] [COUNT <count>] [GROUP <groupname> <ttl>]

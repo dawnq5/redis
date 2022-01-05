@@ -1,6 +1,7 @@
 /* A module that implements defrag callback mechanisms.
  */
 
+#define REDISMODULE_EXPERIMENTAL_API
 #include "redismodule.h"
 #include <stdlib.h>
 

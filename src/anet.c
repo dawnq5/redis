@@ -62,6 +62,9 @@ static void anetSetError(char *err, const char *fmt, ...)
 int anetSetBlock(char *err, int fd, int non_block) {
     int flags;
 
+    //fcntl系统调用可以用来对已打开的文件描述符进行各种控制操作以改变已打开文件的的各种属性
+    //https://blog.csdn.net/fengxinlinux/article/details/51980837
+    //https://www.cnblogs.com/hanerfan/p/5785806.html
     /* Set the socket blocking (if non_block is zero) or non-blocking.
      * Note that fcntl(2) for F_GETFL and F_SETFL can't be
      * interrupted by a signal. */
@@ -109,6 +112,7 @@ int anetCloexec(int fd) {
     if (r == -1 || (r & FD_CLOEXEC))
         return r;
 
+    //它标记文件描述符，以便close()在进程或任何子进程fork()调用其中一个exec*()函数族时自动执行该文件描述符。这对防止泄露文件描述符到例如运行的随机程序非常有用system()
     flags = r | FD_CLOEXEC;
 
     do {
@@ -479,10 +483,6 @@ int anetUnixServer(char *err, char *path, mode_t perm, int backlog)
     int s;
     struct sockaddr_un sa;
 
-    if (strlen(path) > sizeof(sa.sun_path)-1) {
-        anetSetError(err,"unix socket path too long (%zu), must be under %zu", strlen(path), sizeof(sa.sun_path));
-        return ANET_ERR;
-    }
     if ((s = anetCreateSocket(err,AF_LOCAL)) == ANET_ERR)
         return ANET_ERR;
 
@@ -529,11 +529,11 @@ static int anetGenericAccept(char *err, int s, struct sockaddr *sa, socklen_t *l
 
 /* Accept a connection and also make sure the socket is non-blocking, and CLOEXEC.
  * returns the new socket FD, or -1 on error. */
-int anetTcpAccept(char *err, int serversock, char *ip, size_t ip_len, int *port) {
+int anetTcpAccept(char *err, int s, char *ip, size_t ip_len, int *port) {
     int fd;
     struct sockaddr_storage sa;
     socklen_t salen = sizeof(sa);
-    if ((fd = anetGenericAccept(err,serversock,(struct sockaddr*)&sa,&salen)) == ANET_ERR)
+    if ((fd = anetGenericAccept(err,s,(struct sockaddr*)&sa,&salen)) == ANET_ERR)
         return ANET_ERR;
 
     if (sa.ss_family == AF_INET) {
