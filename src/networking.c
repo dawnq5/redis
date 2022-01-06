@@ -237,6 +237,13 @@ void clientInstallWriteHandler(client *c) {
          * loop, we can try to directly write to the client sockets avoiding
          * a system call. We'll only really install the write handler if
          * we'll not be able to write the whole reply at once. */
+        /**
+         * 这里很关键 执行命令 回复给客户端全靠他
+         * 把待回复的客户端添加到回复链表中  ae事件循环在epoll_wait之前会调用eventLoop->beforesleep(eventLoop),这个方法是在ae.c文件的 aeSetBeforeSleepProc 方法中赋值的
+         * ae.c文件的 aeSetBeforeSleepProc 调用是在server.c中调用的,大概在4339行.实际上是执行了 server.c 3342 行中的beforeSleep方法.所以这个方法是ae.c 中 main while循环执行的
+         * server.c 3342 行中的beforeSleep方法 调用了 handleClientsWithPendingWritesUsingThreads ,判断了 clients_pending_write 如果有元素,则调用了 connSetWriteHandler(c->conn, sendReplyToClient) ---> writeToClient _writeToClient ---> connWrite ---> conn->type->write
+         */
+
         c->flags |= CLIENT_PENDING_WRITE;
         listAddNodeHead(server.clients_pending_write,c);
     }
@@ -372,6 +379,7 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
 
 /* Add the object 'obj' string representation to the client output buffer. */
 void addReply(client *c, robj *obj) {
+    //准备回复客户端
     if (prepareClientToWrite(c) != C_OK) return;
 
     if (sdsEncodedObject(obj)) {

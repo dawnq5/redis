@@ -117,6 +117,7 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     }
 
     if (!(flags & OBJ_SET_GET)) {
+        //命令执行结束,回复客户端
         addReply(c, ok_reply ? ok_reply : shared.ok);
     }
 
