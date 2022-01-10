@@ -285,7 +285,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CLIENT_PROTECTED (1<<28) /* Client should not be freed for now. */
 /* #define CLIENT_... (1<<29) currently unused, feel free to use in the future */
 #define CLIENT_PENDING_COMMAND (1<<30) /* Indicates the client has a fully
-                                        * parsed command ready for execution. */
+                                        * parsed command ready for execution. 指示客户端已准备好执行完全解析的命令*/
 #define CLIENT_TRACKING (1ULL<<31) /* Client enabled keys tracking in order to
                                    perform client side caching. */
 #define CLIENT_TRACKING_BROKEN_REDIR (1ULL<<32) /* Target client is invalid. */
@@ -742,13 +742,19 @@ typedef struct RedisModuleDigest {
 #define OBJ_STATIC_REFCOUNT (INT_MAX-1) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
 typedef struct redisObject {
-    unsigned type:4;
-    unsigned encoding:4;
-    unsigned lru:LRU_BITS; /* LRU time (relative to global lru_clock) or
+    /*冒号是什么意思,c语言中的语法,表示有多少位*/
+    unsigned type:4; /*4bit string list set hash,通过命令type key 可以查看key的类型*/
+    unsigned encoding:4;/*embstr raw int ziplist hashtable...,存储编码,使用命令object encoding key查看*/
+    unsigned lru:LRU_BITS; /* 24bbit  LRU time (relative to global lru_clock) or
                             * LFU data (least significant 8 bits frequency
-                            * and most significant 16 bits access time). */
-    int refcount;
-    void *ptr;
+                            * and most significant 16 bits access time). 内存淘汰算法相关*/
+    int refcount;/*4byte 引用计数*/
+    void *ptr;/*8byte 存储数据指针*/
+    /**
+     * redisbject 共占用:(4+4+24)/8 + 4 + 8 = 16 byte
+     * 如果数据范围小于等于44,会使用sdshdr8 存储,而sdshdr8占用4字节存储一些元数据
+     * 所以当小于44字节时, redisObject 刚好能占用在cpu 缓存行(64byte) ,提高读取速度,减少 为共享 这也就是 embstr 嵌入式字符串编码的原理
+     * */
 } robj;
 
 /* The a string name for an object's type as listed above

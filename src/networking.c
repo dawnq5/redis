@@ -2251,6 +2251,7 @@ int processInputBuffer(client *c) {
             /* If we are in the context of an I/O thread, we can't really
              * execute the command here. All we can do is to flag the client
              * as one that needs to process the command. */
+            /*如果处在一个I/O线程的上下文中，就不能在这里执行命令。我们所能做的就是给客户端一个需要处理命令的人*/
             if (io_threads_op != IO_THREADS_OP_IDLE) {
                 serverAssert(io_threads_op == IO_THREADS_OP_READ);
                 c->flags |= CLIENT_PENDING_COMMAND;
@@ -2325,6 +2326,7 @@ void readQueryFromClient(connection *conn) {
         /* Read as much as possible from the socket to save read(2) system calls. */
         readlen = sdsavail(c->querybuf);
     }
+    /*成功返回读取的字节数，出错返回-1并设置errno，如果在调read之前已到达文件末尾，则这次read返回0*/
     nread = connRead(c->conn, c->querybuf+qblen, readlen);
     if (nread == -1) {
         if (connGetState(conn) == CONN_STATE_CONNECTED) {

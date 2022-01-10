@@ -623,7 +623,9 @@ robj *tryObjectEncoding(robj *o) {
     /* Check if we can represent this string as a long integer.
      * Note that we are sure that a string larger than 20 chars is not
      * representable as a 32 nor 64 bit integer. */
+    /*检查是否可以将此字符串表示为长整数。请注意，我们确信大于20个字符的字符串不能表示为32位或64位整数。*/
     len = sdslen(s);
+    /*如果字符串长度小于等于20,尝试将字符串转换为整形 64位系统 指针类型占8个字节,八个字节最多能表示的无符号 整形长度最多为20,有符号19*/
     if (len <= 20 && string2l(s,len,&value)) {
         /* This object is encodable as a long. Try to use a shared object.
          * Note that we avoid using shared integers when maxmemory is used
@@ -640,7 +642,11 @@ robj *tryObjectEncoding(robj *o) {
         } else {
             if (o->encoding == OBJ_ENCODING_RAW) {
                 sdsfree(o->ptr);
+                /*如果可以转,ptr赋值为 整形的值,ptr就不是指针类型了,而是表示一个整形的 value */
                 o->encoding = OBJ_ENCODING_INT;
+                /**
+                 * 整形编码的意义:减少内存 减少io次数
+                 */
                 o->ptr = (void*) value;
                 return o;
             } else if (o->encoding == OBJ_ENCODING_EMBSTR) {

@@ -45,14 +45,25 @@ typedef char *sds;
 /* Note: sdshdr5 is never used, we just access the flags byte directly.
  * However is here to document the layout of type 5 SDS strings. */
 struct __attribute__ ((__packed__)) sdshdr5 {
+    /* char类型 占一个字节,一个字节有8位,前3位存储类型,二进制3位能表示十进制0-7,后5位存储字符串长度,能表示0~2^5-1 */
     unsigned char flags; /* 3 lsb of type, and 5 msb of string length */
-    char buf[];
+    char buf[];/* redis为了兼容c语言的字符串,会在buf后自动加上\0 ,\0是c语言字符串的结束符号,占1个字节*/
 };
 struct __attribute__ ((__packed__)) sdshdr8 {
-    uint8_t len; /* used */
-    uint8_t alloc; /* excluding the header and null terminator */
+    uint8_t len; /* 1byte used */
+    /**
+     * 比如现在的
+     * len=6
+     * alloc=0
+     * 存储字符窜:liming
+     * 现在要存储liming1,空间就不够了,就要扩容,redis扩容是成倍数扩容,扩容后len和alloc的值是
+     * len=7
+     * alloc=5
+     */
+    uint8_t alloc; /* excluding the header and null terminator 不包括头和空终止符 表示字符串未使用的空间大小*/
     unsigned char flags; /* 3 lsb of type, 5 unused bits */
-    char buf[];
+    char buf[]; /*末尾会u自动添加\0 */
+    /*sdshdr8 元数据信息占用:1+1+1+1=4byte */
 };
 struct __attribute__ ((__packed__)) sdshdr16 {
     uint16_t len; /* used */

@@ -47,12 +47,12 @@
 typedef struct dictEntry {
     void *key;
     union {
-        void *val;
+        void *val; /*redisObject*/
         uint64_t u64;
         int64_t s64;
         double d;
     } v;
-    struct dictEntry *next;     /* Next entry in the same hash bucket. */
+    struct dictEntry *next;     /* Next entry in the same hash bucket.  产生hash冲突后使用链表关联起来*/
     void *metadata[];           /* An arbitrary number of bytes (starting at a
                                  * pointer-aligned address) of size as returned
                                  * by dictType's dictEntryMetadataBytes(). */
