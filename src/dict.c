@@ -229,7 +229,7 @@ int dictRehash(dict *d, int n) {
             uint64_t h;
 
             nextde = de->next;
-            /* Get the index in the new hash table */
+            /* Get the index in the new hash table 获取*/
             h = dictHashKey(d, de->key) & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
             de->next = d->ht_table[1][h];
             d->ht_table[1][h] = de;

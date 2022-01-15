@@ -58,6 +58,7 @@ static inline int sdsHdrSize(char type) {
 }
 
 static inline char sdsReqType(size_t string_size) {
+    //根据字符串长度计算出需要使用哪种类型的sds
     if (string_size < 1<<5)
         return SDS_TYPE_5;
     if (string_size < 1<<8)
@@ -106,12 +107,14 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
     char type = sdsReqType(initlen);
     /* Empty strings are usually created in order to append. Use type 8
      * since type 5 is not good at this. */
+    /*空字符串通常是为了追加而创建的。使用类型8.因为类型5不擅长这个*/
     if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
     int hdrlen = sdsHdrSize(type);
     unsigned char *fp; /* flags pointer. */
     size_t usable;
 
     assert(initlen + hdrlen + 1 > initlen); /* Catch size_t overflow */
+    //最终申请的长度为结构体长度加上字符串长度
     sh = trymalloc?
         s_trymalloc_usable(hdrlen+initlen+1, &usable) :
         s_malloc_usable(hdrlen+initlen+1, &usable);
@@ -120,7 +123,9 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
         init = NULL;
     else if (!init)
         memset(sh, 0, hdrlen+initlen+1);
+    //结构体中的buf, sh指向结构体头部，hdrlen为结构体的长度
     s = (char*)sh+hdrlen;
+    //buf-1就是type了，也就是结构体中的flags
     fp = ((unsigned char*)s)-1;
     usable = usable-hdrlen-1;
     if (usable > sdsTypeMaxSize(type))
@@ -131,6 +136,18 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
             break;
         }
         case SDS_TYPE_8: {
+
+            // 从s中获取header指针sh,并且设置头信息
+            /**
+             * 宏定义能够减少额外的开销 因为如果写成普通函数的话，函数的调用会在用户栈开辟空间，形参压栈，返回时还需要释放栈，可想而知的开销。使用宏定义函数则在代码规模和速度方面都比函数更胜一筹。
+             * 宏定义的本质就是替换，所以在使用宏定义函数的地方，执行的时候相当于是在直接执行 struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T))) 这句代码
+             * 这段代码的含义是从字符串指针s 向后移动 sdshdr 大小,也就得到了sdshdr的指针
+             */
+            /**
+             * SDS_HDR_VAR 的作用是将sh的类型修改为结构体指针，因为之前sh 一直都是空指针，(虽然指针的指向地址是headr，但是没有限定它类型)不然后面没法用sh->len, sh->alloc 来访问对应的结构体成员。
+             * 最后s里面的内容为:[len|alloc|flag|buf\0]
+             */
+
             SDS_HDR_VAR(8,s);
             sh->len = initlen;
             sh->alloc = usable;
@@ -162,6 +179,8 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
     if (initlen && init)
         memcpy(s, init, initlen);
     s[initlen] = '\0';
+    uint8_t t = s[-3];
+    printf("s=%d,total=%d,usable=%d\n", sdslen(s),t,(uint8_t)s[-2]);
     return s;
 }
 

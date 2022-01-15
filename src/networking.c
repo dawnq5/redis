@@ -2005,6 +2005,7 @@ int processMultibulkBuffer(client *c) {
         /* Setup argv array on client structure */
         if (c->argv) zfree(c->argv);
         c->argv_len = min(c->multibulklen, 1024);
+        //分配 argv数组 的大小  例如:set aa bb ,就是sizeof(robj*)*3
         c->argv = zmalloc(sizeof(robj*)*c->argv_len);
         c->argv_len_sum = 0;
     }
@@ -2096,6 +2097,14 @@ int processMultibulkBuffer(client *c) {
                 c->querybuf = sdsnewlen(SDS_NOINIT,c->bulklen+2);
                 sdsclear(c->querybuf);
             } else {
+                //参数创建为robj 类型
+                /**
+                 * 例如:
+                 * set aa aa
+                 * c->argv[0]=set
+                 * c->argv[1]=aa
+                 * c->argv[2]=aa
+                 */
                 c->argv[c->argc++] =
                     createStringObject(c->querybuf+c->qb_pos,c->bulklen);
                 c->argv_len_sum += c->bulklen;
@@ -2104,6 +2113,14 @@ int processMultibulkBuffer(client *c) {
             c->bulklen = -1;
             c->multibulklen--;
         }
+    }
+
+    if(c->argc == 3){
+        //执行命令:set aa aa
+        char* c1 = c->argv[0]->ptr;//set
+        char* c2 = c->argv[1]->ptr;//aa
+        char* c3 = c->argv[2]->ptr;//aa
+        printf("%s",c1);
     }
 
     /* We're done when c->multibulk == 0 */

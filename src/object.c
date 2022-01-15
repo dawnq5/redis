@@ -82,11 +82,15 @@ robj *createRawStringObject(const char *ptr, size_t len) {
  * an object where the sds string is actually an unmodifiable string
  * allocated in the same chunk as the object itself. */
 robj *createEmbeddedStringObject(const char *ptr, size_t len) {
+    //分配内存空间 zmalloc函数可以 redisObject和sds（Redis的字符串结构）是一起分配内存的，他们的地址是连续的，这样可以减少内存分配的次数和避免内存碎片的出现
     robj *o = zmalloc(sizeof(robj)+sizeof(struct sdshdr8)+len+1);
+    //将robj 对象以后的内存赋值给sh 使用
     struct sdshdr8 *sh = (void*)(o+1);
 
     o->type = OBJ_STRING;
     o->encoding = OBJ_ENCODING_EMBSTR;
+    //sh+1即加上sdshdr8的字节数，而sdshdr8为3字节即len+alloc+flags
+    //那么加1后，ptr指向的为sh->buf
     o->ptr = sh+1;
     o->refcount = 1;
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {

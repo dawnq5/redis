@@ -75,6 +75,17 @@ static int checkStringLength(client *c, long long size) {
 /* Forward declaration */
 static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int unit, long long *milliseconds);
 
+/**
+ *
+ * @param c
+ * @param flags
+ * @param key  是在networking.c中大概第2101行调createStringObject方法,创建为robj类型
+ * @param val
+ * @param expire
+ * @param unit
+ * @param ok_reply
+ * @param abort_reply
+ */
 void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
     long long milliseconds = 0; /* initialized to avoid any harmness warning */
     int found = 0;
